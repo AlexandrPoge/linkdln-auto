@@ -83,6 +83,73 @@ class ReviewPageTests(unittest.TestCase):
         self.assertNotIn("Сообщение рекрутеру для LinkedIn · не отправлено",
                          render_page([row | {"is_active": False}], "secret", profile=profile))
 
+    def test_dashboard_shows_filtered_jobs_and_search_status_when_queue_empty(self) -> None:
+        profile = CandidateProfile.from_dict({
+            "full_name": "Example Candidate", "roles": ["Automation Engineer"],
+            "countries": ["Europe"], "skills": ["n8n"], "work_modes": ["remote"],
+        })
+        discovered = [{
+            "source": "ashby", "board_token": "example", "external_id": "1",
+            "title": "Sales <Manager>", "company": "Example & Co",
+            "location": "Remote - Europe", "description": "Manage accounts.",
+            "url": "https://example.com/jobs/1", "source_updated_at": None,
+        }]
+        status = {"running": False, "started_at": None, "finished_at": None,
+                  "report": {"sources": [{"source": "ashby", "status": "ok", "new": 1}],
+                             "successful": 1, "failed": 0},
+                  "error": None, "interval_seconds": 3600}
+        page = render_page([], "secret", profile=profile, discovered=discovered, search_status=status)
+        self.assertIn("Что нашлось в источниках", page)
+        self.assertIn("Sales &lt;Manager&gt;", page)
+        self.assertIn("Example &amp; Co", page)
+        self.assertIn("Отсеяно", page)
+        self.assertIn("Руководящая позиция вне текущего поиска.", page)
+        self.assertIn("новых вакансий: 1", page)
+        self.assertIn('action="/search-now"', page)
+
+    def test_search_now_requires_token_and_uses_runner(self) -> None:
+        repository = Mock()
+        runner = Mock()
+        runner.trigger.return_value = True
+        handler_class = make_handler(repository, "test-token", runner)
+
+        def submit(token: str) -> int:
+            body = urlencode({"csrf": token, "track": "international"}).encode()
+            handler = object.__new__(handler_class)
+            handler.server = SimpleNamespace(server_port=8765)
+            handler.headers = {"Host": "127.0.0.1:8765", "Content-Length": str(len(body)),
+                               "Content-Type": "application/x-www-form-urlencoded"}
+            handler.path = "/search-now"
+            handler.rfile = io.BytesIO(body)
+            handler.wfile = io.BytesIO()
+            handler.send_response = Mock()
+            handler.send_header = Mock()
+            handler.end_headers = Mock()
+            handler.do_POST()
+            return handler.send_response.call_args.args[0]
+
+        self.assertEqual(submit("wrong"), 403)
+        runner.trigger.assert_not_called()
+        self.assertEqual(submit("test-token"), 303)
+        runner.trigger.assert_called_once_with()
+
+    def test_nearby_vacancies_are_visible_before_collapsed_irrelevant_results(self) -> None:
+        profile = CandidateProfile.from_dict({
+            "full_name": "Example Candidate", "roles": ["Automation Engineer"],
+            "countries": ["Europe"], "skills": ["n8n"], "work_modes": ["remote"],
+        })
+        base = {"source": "ashby", "board_token": "example", "company": "Example",
+                "location": "Remote - Europe", "description": "Build workflows.",
+                "source_updated_at": None}
+        jobs = [base | {"external_id": str(index), "title": f"Sales Manager {index}",
+                        "url": f"https://example.com/{index}"} for index in range(10)]
+        jobs.append(base | {"external_id": "11", "title": "AI Workflow Specialist",
+                            "url": "https://example.com/11"})
+        page = render_page([], "secret", profile=profile, discovered=jobs)
+        self.assertLess(page.index("AI Workflow Specialist"), page.index("Остальные найденные вакансии"))
+        self.assertIn("Отсеяно", page)
+        self.assertIn("Остальные найденные вакансии (10)", page)
+
     def test_approved_item_is_not_editable(self) -> None:
         row = _review() | {"status": "approved"}
         page = render_page([row], "secret")
@@ -97,6 +164,7 @@ class ReviewPageTests(unittest.TestCase):
 
     def test_rejected_item_can_be_restored(self) -> None:
         page = render_page([_review() | {"status": "rejected"}], "secret")
+        self.assertIn("Отклонённые черновики (1)", page)
         self.assertIn('action="/restore/7"', page)
         self.assertNotIn('action="/edit/7"', page)
 

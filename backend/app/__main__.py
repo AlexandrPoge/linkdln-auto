@@ -10,6 +10,7 @@ import psycopg
 
 from app.candidate.profile import CandidateProfile
 from app.api.review import serve
+from app.api.search_runner import SearchRunner
 from app.applications.delivery import deliver_approved
 from app.infrastructure.persistence.postgres import Repository
 from app.integrations.email_sender import SMTPApplicationSender, SMTPSettings
@@ -20,13 +21,20 @@ from app.integrations.job_sources.linkedin_alert import parse_alert_email
 from app.matching.rules import evaluate
 from app.templates.drafts import render_application, render_linkedin_message
 from app.vacancies.models import SEARCH_TRACKS, Vacancy
-from app.vacancies.sync import parse_search_plan, run_searches
+from app.vacancies.sync import SearchSource, parse_search_plan, run_searches
 
 
 def _json_default(value: object) -> str:
     if isinstance(value, datetime):
         return value.isoformat()
     raise TypeError(f"cannot serialize {type(value).__name__}")
+
+
+def _load_search_plan(path: Path) -> tuple[SearchSource, ...]:
+    config_bytes = path.read_bytes()
+    if len(config_bytes) > 64_000:
+        raise ValueError("search config exceeds 64 KB")
+    return parse_search_plan(json.loads(config_bytes))
 
 
 def main() -> int:
@@ -54,6 +62,9 @@ def main() -> int:
     matches.add_argument("--track", choices=SEARCH_TRACKS, help="Filter Belarus or international search")
     server = commands.add_parser("serve", help="Open the local review queue (does not send applications)")
     server.add_argument("--port", type=int, default=8765)
+    server.add_argument("--config", type=Path, help="Search config; defaults to local data/searches.json if present")
+    server.add_argument("--interval-minutes", type=int, default=360,
+                        help="Refresh public sources while this server is running (default: 360)")
     delivery = commands.add_parser("send-approved", help="Preview or email approved applications with explicit recipients")
     delivery.add_argument("--track", choices=SEARCH_TRACKS)
     delivery.add_argument("--limit", type=int, default=10)
@@ -89,10 +100,7 @@ def main() -> int:
             saved = repository.get_profile()
             print(json.dumps(saved.to_dict() if saved else None, ensure_ascii=False, indent=2))
         elif args.command == "sync":
-            config_bytes = args.config.read_bytes()
-            if len(config_bytes) > 64_000:
-                raise ValueError("search config exceeds 64 KB")
-            plan = parse_search_plan(json.loads(config_bytes))
+            plan = _load_search_plan(args.config)
             result = run_searches(repository, plan)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 1 if result["failed"] else 0
@@ -121,8 +129,13 @@ def main() -> int:
             print(json.dumps(repository.list_vacancies(args.limit, active_only=not args.all, track=args.track),
                              ensure_ascii=False, indent=2, default=_json_default))
         elif args.command == "serve":
+            if not 5 <= args.interval_minutes <= 1440:
+                raise ValueError("interval must be 5 to 1440 minutes")
+            default_config = Path(__file__).resolve().parents[2] / "data" / "searches.json"
+            config = args.config or (default_config if default_config.is_file() else None)
+            runner = SearchRunner(repository, _load_search_plan(config), args.interval_minutes * 60) if config else None
             try:
-                serve(repository, args.port)
+                serve(repository, args.port, search_runner=runner)
             except KeyboardInterrupt:
                 print("\nReview queue stopped")
         elif args.command == "send-approved":

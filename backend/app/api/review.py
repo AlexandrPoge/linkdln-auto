@@ -1,11 +1,13 @@
 import html
 import re
 import secrets
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 
 from app.applications.queue import refresh_queue
+from app.api.search_runner import SearchRunner
 from app.candidate.profile import CandidateProfile
 from app.infrastructure.persistence.postgres import Repository
 from app.matching.rules import evaluate
@@ -35,17 +37,109 @@ def _vacancy_link(url: str) -> str:
     return f'<a href="{_escape(url)}" target="_blank" rel="noopener noreferrer">Открыть вакансию ↗</a>'
 
 
+def _display_reason(reason: str) -> str:
+    translations = {
+        "Management role is outside the target roles.": "Руководящая позиция вне текущего поиска.",
+        "QA/test automation is outside the target roles.": "QA-автоматизация вне текущего поиска.",
+        "Job title does not match target roles.": "Название не совпадает с целевой ролью.",
+        "Job title does not match the target role type.": "Тип роли не совпадает с целевой инженерной позицией.",
+        "Vacancy explicitly excludes remote work.": "Вакансия исключает удалённую работу.",
+        "Location is listed as office-based or hybrid.": "Вакансия офисная или гибридная.",
+        "Remote work is not confirmed.": "Удалённая работа не подтверждена.",
+        "Listed remote locations are outside the target European region.": "География удалённой работы вне целевого региона.",
+    }
+    if reason.startswith("Listed remote locations do not include"):
+        return "Указанные страны удалённой работы не включают страну проживания."
+    if reason.startswith("The vacancy explicitly excludes applicants from"):
+        return "Вакансия исключает кандидатов из страны проживания."
+    return translations.get(reason, reason)
+
+
+def _search_status(search_status: dict[str, Any] | None) -> str:
+    if search_status is None:
+        return '<p class="muted">Автопоиск не настроен. Добавь локальный data/searches.json и перезапусти сервер.</p>'
+    if search_status["running"]:
+        summary = "Идёт поиск по источникам. Обнови страницу через минуту."
+        style = "running"
+    elif search_status["error"]:
+        summary = f"Ошибка последнего запуска: {_escape(search_status['error'])}"
+        style = "error"
+    elif report := search_status["report"]:
+        new_count = sum(int(item.get("new", 0)) for item in report["sources"] if item["status"] == "ok")
+        summary = (f"Последний запуск · источников проверено: {report['successful']} · "
+                   f"ошибок: {report['failed']} · новых вакансий: {new_count}. Ничего не отправлено.")
+        style = "ok" if not report["failed"] else "error"
+    else:
+        summary = "Первый поиск запустится при открытии сервера."
+        style = "running"
+    finished = search_status["finished_at"]
+    when = datetime.fromisoformat(finished).astimezone().strftime("%d.%m.%Y %H:%M") if finished else "ещё не завершён"
+    hours = search_status["interval_seconds"] // 3600
+    interval = f"каждые {hours} ч" if hours else f"каждые {search_status['interval_seconds'] // 60} мин"
+    return (f'<p class="run-status {style}" role="status">{summary}</p>'
+            f'<p class="muted">Последняя проверка: {_escape(when)} · Повтор: {interval}, пока приложение запущено.</p>')
+
+
+def _discovered_vacancies(rows: list[dict[str, Any]], profile: CandidateProfile | None) -> tuple[str, int]:
+    if profile is None:
+        return '<p class="empty">Сначала сохраните профиль кандидата.</p>', 0
+    ranked: list[tuple[int, bool, str]] = []
+    matching = 0
+    for row in rows:
+        job = Vacancy(**{field: row[field] for field in Vacancy.__dataclass_fields__ if field in row})
+        result = evaluate(profile, job)
+        possible = result.status == "review"
+        matching += possible
+        label = "На проверку" if possible else "Отсеяно"
+        reason = result.warnings[0] if possible and result.warnings else result.reasons[0] if result.reasons else ""
+        reason = _display_reason(reason)
+        title = job.title.casefold()
+        relevance = (5 if re.search(r"automat|автомат|workflow|integration|интеграц", title) else 0)
+        relevance += 2 if re.search(r"\b(ai|agentic|rpa|n8n)\b", title) else 0
+        relevance += sum(1 for skill in profile.skills if skill.casefold() in title)
+        if re.search(r"\b(sales|account|marketing|manager|director|qa|quality assurance)\b", title):
+            relevance = 0
+        relevance += 10 if possible else 0
+        ranked.append((relevance, possible, f'''
+            <article class="discovery-card">
+              <div class="discovery-head"><span class="chip {'possible' if possible else 'filtered'}">{label}</span>
+              <span class="muted">{_escape(job.source)}</span></div>
+              <h3>{_escape(job.title)}</h3>
+              <p class="meta compact" title="{_escape(job.location)}">{_escape(job.company)} · {_escape(job.location)}</p>
+              <p class="reason">{_escape(reason)}</p>
+              <p>{_vacancy_link(job.url)}</p>
+            </article>'''))
+    ranked.sort(key=lambda item: (-item[0], not item[1]))
+    featured = [item for item in ranked if item[0] > 0][:8]
+    cards = "".join(item[2] for item in featured)
+    if not cards:
+        cards = ('<p class="empty">Среди последних вакансий нет близких к автоматизации. '
+                 'Остальные предложения можно открыть ниже.</p>' if ranked else
+                 '<p class="empty">Источники ещё не вернули вакансий для этого направления.</p>')
+    featured_ids = {id(item) for item in featured}
+    remaining = [item[2] for item in ranked if id(item) not in featured_ids]
+    rest_html = ""
+    if remaining:
+        note = '<p class="muted">Показаны первые 50 из остальных.</p>' if len(remaining) > 50 else ""
+        rest_html = (f'<details class="all-results"><summary>Остальные найденные вакансии ({len(remaining)})</summary>'
+                     f'<div class="discovery-list">{"".join(remaining[:50])}</div>{note}</details>')
+    return f'<div class="discovery-list">{cards}</div>{rest_html}', matching
+
+
 def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
-                track: str = "belarus", profile: CandidateProfile | None = None) -> str:
+                track: str = "belarus", profile: CandidateProfile | None = None,
+                discovered: list[dict[str, Any]] | None = None,
+                search_status: dict[str, Any] | None = None) -> str:
     if track not in SEARCH_TRACKS:
         raise ValueError("invalid search track")
     track_input = f'<input type="hidden" name="track" value="{track}">'
     cards: list[str] = []
+    archived_cards: list[str] = []
     for row in rows:
         review_id = int(row["id"])
         status = row.get("delivery_status") or row["status"]
-        warnings = "".join(f"<li>{_escape(item)}</li>" for item in row["warnings"])
-        reasons = "".join(f"<li>{_escape(item)}</li>" for item in row["reasons"])
+        warnings = "".join(f"<li>{_escape(_display_reason(item))}</li>" for item in row["warnings"])
+        reasons = "".join(f"<li>{_escape(_display_reason(item))}</li>" for item in row["reasons"])
         linkedin_draft = ""
         if profile is not None and row["is_active"]:
             job = Vacancy(source=row.get("source", "manual"), board_token="review", external_id=str(review_id),
@@ -94,7 +188,8 @@ def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
                 </form>'''
         stale = '<p class="warning">Вакансия закрыта — утверждение недоступно.</p>' if not row["is_active"] else ""
         source_note = '<p class="warning">Источник: <a href="https://himalayas.app/" target="_blank" rel="noopener noreferrer">Himalayas</a>. Условия проверяй у работодателя.</p>' if row.get("source") == "himalayas" else ""
-        cards.append(f'''
+        target_cards = archived_cards if row["status"] == "rejected" else cards
+        target_cards.append(f'''
             <article class="card">
                 <div class="top"><span class="status {status}">{_escape(_STATUS_LABELS[status])}</span><span class="score">Оценка {int(row['score'])}/100</span></div>
                 <h2>{_escape(row['title'])}</h2>
@@ -107,15 +202,21 @@ def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
                 {linkedin_draft}
                 {controls}
             </article>''')
-    cards_html = "".join(cards) if cards else '<p class="empty">Очередь пуста. Импортируйте вакансии и нажмите «Обновить очередь».</p>'
+    cards_html = "".join(cards) if cards else '<p class="empty">Подходящих черновиков пока нет. Ниже видны найденные вакансии и причины отсева.</p>'
+    archive_html = (f'<details class="all-results"><summary>Отклонённые черновики ({len(archived_cards)})</summary>'
+                    f'{"".join(archived_cards)}</details>') if archived_cards else ""
     notice_html = f'<p class="notice" role="status">{_escape(notice)}</p>' if notice else ""
     draft_ids = sum(row["status"] == "draft" and row["is_active"] for row in rows)
+    discovered = discovered or []
+    discovery_html, possible_count = _discovered_vacancies(discovered, profile)
+    search_button = (f'<form method="post" action="/search-now"><input type="hidden" name="csrf" value="{_escape(csrf_token)}">'
+                     f'{track_input}<button type="submit">Искать сейчас</button></form>') if search_status is not None else ""
     return f'''<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Очередь откликов</title><style>
-:root {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #17253d; background: #f4f7fb; }}
-body {{ margin: 0; }} main {{ max-width: 1040px; margin: auto; padding: 28px 18px 70px; }}
-h1 {{ margin: 0 0 8px; font-size: 2rem; }} h2 {{ margin: 12px 0 4px; }} h3 {{ font-size: .92rem; margin: 0 0 8px; }}
+<title>Поиск работы · Automation Engineer</title><style>
+:root {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #17253d; background: #eef3f9; }}
+body {{ margin: 0; }} main {{ max-width: 1120px; margin: auto; padding: 32px 18px 70px; }}
+h1 {{ margin: 0 0 8px; font-size: 2.2rem; }} h2 {{ margin: 12px 0 4px; }} h3 {{ font-size: .92rem; margin: 0 0 8px; }}
 .subtitle,.meta {{ color: #5d6a7d; }} .toolbar {{ display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin: 24px 0; }}
 button {{ background:#1157ad; color:white; border:0; border-radius:8px; padding:10px 16px; font-weight:600; cursor:pointer; }}
 button:hover {{ background:#0d4489; }} .secondary button {{ background:#e7eef9; color:#144783; }}
@@ -131,20 +232,49 @@ input[type=email] {{ box-sizing:border-box; width:100%; padding:10px; font:inher
 .empty {{ padding:28px; background:white; border-radius:12px; }} .safety {{ background:#fff4dc; padding:12px; border-radius:8px; }}
 .tabs {{ display:flex; gap:8px; margin:20px 0; flex-wrap:wrap; }} .tabs a {{ padding:10px 15px; border-radius:8px; color:#144783; background:#e7eef9; text-decoration:none; font-weight:600; }}
 .tabs a[aria-current="page"] {{ color:white; background:#1157ad; }}
-@media(max-width:680px) {{ .detail-grid {{ grid-template-columns:1fr; }} }}
+.hero {{ background:linear-gradient(125deg,#102f59,#175e9f); color:white; border-radius:20px; padding:30px; box-shadow:0 14px 30px #10376426; }}
+.hero .subtitle {{ color:#d9eaff; }} .hero h1 {{ letter-spacing:-.03em; }}
+.metrics {{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:18px 0; }}
+.metric {{ background:white; border:1px solid #dce5f1; border-radius:14px; padding:18px 20px; }}
+.metric strong {{ display:block; font-size:1.9rem; color:#164d89; }} .metric span {{ color:#5d6a7d; font-size:.9rem; }}
+.search-panel {{ background:white; border:1px solid #dce5f1; border-radius:14px; padding:20px; margin:18px 0; }}
+.search-panel h2 {{ margin-top:0; }} .run-status {{ margin-bottom:4px; font-weight:600; }}
+.run-status.error {{ color:#9a4a05; }} .run-status.ok {{ color:#126447; }} .run-status.running {{ color:#1557a0; }}
+.muted {{ color:#68778c; font-size:.9rem; }} .section-title {{ margin:32px 0 10px; }}
+.discovery-list {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:14px; }}
+.discovery-card {{ background:white; border:1px solid #dce5f1; border-radius:12px; padding:17px; }}
+.discovery-card h3 {{ font-size:1rem; margin:10px 0 4px; }} .discovery-card p {{ margin:7px 0; }}
+.discovery-head {{ display:flex; align-items:center; justify-content:space-between; }}
+.chip {{ display:inline-block; border-radius:99px; padding:4px 9px; font-size:.77rem; font-weight:700; }}
+.chip.possible {{ background:#ddf3e5; color:#176845; }} .chip.filtered {{ background:#eef1f5; color:#647084; }}
+.reason {{ color:#34465b; font-size:.88rem; }}
+.compact {{ display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }}
+.all-results {{ background:#fff; border:1px solid #dce5f1; border-radius:12px; padding:14px 18px; margin:18px 0; }}
+.all-results summary {{ color:#164d89; }}
+@media(max-width:680px) {{ .detail-grid,.discovery-list,.metrics {{ grid-template-columns:1fr; }} .hero {{ padding:22px; }} }}
 </style></head><body><main>
-<h1>Очередь откликов</h1><p class="subtitle">Подбор и редактирование перед отправкой</p>
-<p class="safety">Утверждение меняет только статус в локальной базе. Отклик не отправляется работодателю.</p>
+<div class="hero"><h1>Поиск работы</h1><p class="subtitle">Automation Engineer · удалённо · Беларусь и международный рынок</p></div>
 <nav class="tabs" aria-label="Направление поиска">
 <a href="/?track=belarus" {'aria-current="page"' if track == 'belarus' else ''}>В Беларуси</a>
 <a href="/?track=international" {'aria-current="page"' if track == 'international' else ''}>За рубежом · удалённо</a>
 </nav>
 <p class="subtitle">{'Вакансии, которые источник относит к удалённой работе из Беларуси. Условия подтверждайте у работодателя.' if track == 'belarus' else 'Международный поиск. Возможность работать из Беларуси проверяйте у работодателя; страна компании не подтверждена автоматически.'}</p>
 {notice_html}
+<div class="metrics"><div class="metric"><strong>{len(discovered)}</strong><span>Проверено последних вакансий (до 200)</span></div>
+<div class="metric"><strong>{possible_count}</strong><span>Прошли первичный фильтр</span></div>
+<div class="metric"><strong>{draft_ids}</strong><span>Черновиков на проверку</span></div></div>
+<section class="search-panel"><h2>Автоматический поиск</h2>{_search_status(search_status)}{search_button}
+<p class="muted">Поиск идёт по открытым источникам. LinkedIn-переписка и отправка откликов здесь не запускаются.</p></section>
+<h2 class="section-title">Очередь откликов</h2>
+<p class="safety">Утверждение меняет только статус в локальной базе. Отклик не отправляется работодателю.</p>
 <div class="toolbar">
 <form method="post" action="/refresh" class="secondary"><input type="hidden" name="csrf" value="{_escape(csrf_token)}">{track_input}<button type="submit">Обновить очередь</button></form>
 <form method="post" action="/approve" id="approve-form"><input type="hidden" name="csrf" value="{_escape(csrf_token)}">{track_input}<label class="pick"><input type="checkbox" name="checked" value="yes" required> Я проверил условия вакансий</label><button type="submit">Утвердить выбранные ({draft_ids} доступны)</button></form>
-</div>{cards_html}</main></body></html>'''
+</div>{cards_html}{archive_html}
+<h2 class="section-title">Что нашлось в источниках</h2>
+<p class="muted">Сначала близкие по теме, остальные — внутри списка. Это сохранённые вакансии; не все источники обновлялись последним запуском. «На проверку» не подтверждает право работать из Беларуси.</p>
+{discovery_html}
+</main></body></html>'''
 
 
 def _ids(values: list[str]) -> list[int]:
@@ -156,7 +286,7 @@ def _ids(values: list[str]) -> list[int]:
     return result
 
 
-def make_handler(repository: Repository, csrf_token: str):
+def make_handler(repository: Repository, csrf_token: str, search_runner: SearchRunner | None = None):
     class ReviewHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
             return  # Local drafts and form actions should not be echoed into terminal logs.
@@ -200,8 +330,10 @@ def make_handler(repository: Repository, csrf_token: str):
                 self._respond(400, "Invalid search track")
                 return
             try:
+                profile = repository.get_profile()
                 self._respond(200, render_page(repository.list_reviews(track=track), csrf_token, notice, track,
-                                               repository.get_profile()))
+                                               profile, repository.list_vacancies(200, track=track),
+                                               search_runner.snapshot() if search_runner else None))
             except Exception:
                 self._respond(500, "Could not load the review queue")
 
@@ -229,6 +361,11 @@ def make_handler(repository: Repository, csrf_token: str):
                 if path == "/refresh":
                     result = refresh_queue(repository, track=track)
                     notice = f"Найдено подходящих: {result['matching']}; новых черновиков: {result['added']}."
+                elif path == "/search-now":
+                    if search_runner is None:
+                        raise ValueError("automatic search is not configured")
+                    notice = ("Поиск запущен. Обнови страницу, чтобы увидеть результат."
+                              if search_runner.trigger() else "Поиск уже выполняется.")
                 elif path == "/approve":
                     if data.get("checked") != ["yes"]:
                         raise ValueError("confirm that you checked the vacancy requirements")
@@ -264,12 +401,17 @@ def make_handler(repository: Repository, csrf_token: str):
     return ReviewHandler
 
 
-def serve(repository: Repository, port: int = 8765) -> None:
+def serve(repository: Repository, port: int = 8765, *, search_runner: SearchRunner | None = None) -> None:
     if not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(repository, secrets.token_urlsafe(32)))
+    server = ThreadingHTTPServer(("127.0.0.1", port),
+                                 make_handler(repository, secrets.token_urlsafe(32), search_runner))
     print(f"Review queue: http://127.0.0.1:{server.server_port}/", flush=True)
     try:
+        if search_runner is not None:
+            search_runner.start()
         server.serve_forever()
     finally:
+        if search_runner is not None:
+            search_runner.stop()
         server.server_close()
