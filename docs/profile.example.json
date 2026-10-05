@@ -1,0 +1,10 @@
+{
+  "full_name": "Example Candidate",
+  "resume_text": "Short factual summary of experience and achievements.",
+  "roles": ["Software Engineer"],
+  "countries": ["United States"],
+  "skills": ["Python", "PostgreSQL"],
+  "work_modes": ["remote", "hybrid"],
+  "salary_min": null,
+  "salary_currency": null
+}

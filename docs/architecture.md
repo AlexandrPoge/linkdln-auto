@@ -25,6 +25,6 @@ Use a modular monolith: one Python backend for the API, business rules, and sche
 
 ## Initial technology direction
 
-Python/FastAPI backend, PostgreSQL persistence, Next.js/TypeScript frontend, and a background worker. Choose concrete libraries and deployment settings when the first vertical slice is implemented; this skeleton does not install or configure them.
+The backend is Python with PostgreSQL persistence. Stage 2 exposes a local CLI for profile storage and one Greenhouse source adapter. FastAPI, Next.js/TypeScript, and scheduled jobs are planned for later stages; they are not needed for the import workflow yet.
 
 External platform access must use permitted mechanisms. Browser actions that encounter login challenges or CAPTCHA should stop and surface the issue for review.
