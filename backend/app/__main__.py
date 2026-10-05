@@ -16,7 +16,7 @@ from app.integrations.job_sources.ashby import AshbySourceError, fetch_board as 
 from app.integrations.job_sources.greenhouse import SourceError, fetch_board
 from app.integrations.job_sources.himalayas import HimalayasSourceError, fetch_search
 from app.matching.rules import evaluate
-from app.templates.drafts import render_application
+from app.templates.drafts import render_application, render_linkedin_message
 from app.vacancies.models import SEARCH_TRACKS, Vacancy
 
 
@@ -124,6 +124,8 @@ def main() -> int:
                                 "url": job.url, "source": job.source, "external_id": job.external_id},
                     "match": result.to_dict(),
                     "draft": render_application(saved, job, result) if result.status == "review" else None,
+                    "linkedin_message": render_linkedin_message(saved, job, result)
+                    if result.status == "review" else None,
                 })
             results.sort(key=lambda item: item["match"]["score"], reverse=True)
             print(json.dumps(results, ensure_ascii=False, indent=2))

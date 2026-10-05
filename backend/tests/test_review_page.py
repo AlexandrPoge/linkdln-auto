@@ -70,6 +70,19 @@ class ReviewPageTests(unittest.TestCase):
         page = render_page([_review() | {"source": "himalayas"}], "secret")
         self.assertIn("Источник: <a href=\"https://himalayas.app/\"", page)
 
+    def test_page_shows_unsent_linkedin_message_for_matching_active_job(self) -> None:
+        profile = CandidateProfile.from_dict({
+            "full_name": "Example Candidate", "roles": ["Automation Engineer"],
+            "countries": ["Europe"], "skills": ["n8n"], "work_modes": ["remote"],
+        })
+        row = _review() | {"title": "Automation Engineer", "description": "Build n8n workflows."}
+        page = render_page([row], "secret", profile=profile)
+        self.assertIn("Сообщение рекрутеру для LinkedIn · не отправлено", page)
+        self.assertIn("I work with n8n", page)
+        self.assertIn("readonly", page)
+        self.assertNotIn("Сообщение рекрутеру для LinkedIn · не отправлено",
+                         render_page([row | {"is_active": False}], "secret", profile=profile))
+
     def test_approved_item_is_not_editable(self) -> None:
         row = _review() | {"status": "approved"}
         page = render_page([row], "secret")

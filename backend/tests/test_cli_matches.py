@@ -34,6 +34,8 @@ class MatchCommandTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["match"]["status"], "review")
         self.assertIn("n8n", result[0]["draft"])
+        self.assertIn("n8n", result[0]["linkedin_message"])
+        self.assertNotIn("linkedin_message", result[0]["draft"])
         repository.list_vacancies.assert_called_once_with(50)
         repository.initialize.assert_called_once_with()
 

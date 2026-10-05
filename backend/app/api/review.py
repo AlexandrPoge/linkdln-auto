@@ -6,8 +6,12 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 
 from app.applications.queue import refresh_queue
+from app.candidate.profile import CandidateProfile
 from app.infrastructure.persistence.postgres import Repository
+from app.matching.rules import evaluate
+from app.templates.drafts import render_linkedin_message
 from app.vacancies.models import SEARCH_TRACKS
+from app.vacancies.models import Vacancy
 
 _MAX_BODY_BYTES = 64_000
 _STATUS_LABELS = {
@@ -32,7 +36,7 @@ def _vacancy_link(url: str) -> str:
 
 
 def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
-                track: str = "belarus") -> str:
+                track: str = "belarus", profile: CandidateProfile | None = None) -> str:
     if track not in SEARCH_TRACKS:
         raise ValueError("invalid search track")
     track_input = f'<input type="hidden" name="track" value="{track}">'
@@ -42,6 +46,18 @@ def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
         status = row.get("delivery_status") or row["status"]
         warnings = "".join(f"<li>{_escape(item)}</li>" for item in row["warnings"])
         reasons = "".join(f"<li>{_escape(item)}</li>" for item in row["reasons"])
+        linkedin_draft = ""
+        if profile is not None and row["is_active"]:
+            job = Vacancy(source=row.get("source", "manual"), board_token="review", external_id=str(review_id),
+                          company=row["company"], title=row["title"], location=row["location"],
+                          description=row["description"], url=row["url"], source_updated_at=None,
+                          search_track=track)
+            result = evaluate(profile, job)
+            if result.status == "review":
+                message = render_linkedin_message(profile, job, result)
+                linkedin_draft = (f'<details><summary>Сообщение рекрутеру для LinkedIn · не отправлено</summary>'
+                                  f'<p class="warning">Текст подготовлен автоматически. Проверь адресата и скопируй его вручную в LinkedIn.</p>'
+                                  f'<textarea readonly aria-label="Сообщение рекрутеру">{_escape(message)}</textarea></details>')
         controls = ""
         if status == "draft" and row["is_active"]:
             controls = f'''
@@ -88,6 +104,7 @@ def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
                 {stale}
                 <details><summary>Почему подобрана · условия проверки</summary><div class="detail-grid"><div><h3>Совпадения</h3><ul>{reasons}</ul></div><div><h3>Проверить вручную</h3><ul>{warnings}</ul></div></div></details>
                 <details><summary>Описание вакансии</summary><p class="description">{_escape(row['description'])}</p></details>
+                {linkedin_draft}
                 {controls}
             </article>''')
     cards_html = "".join(cards) if cards else '<p class="empty">Очередь пуста. Импортируйте вакансии и нажмите «Обновить очередь».</p>'
@@ -183,7 +200,8 @@ def make_handler(repository: Repository, csrf_token: str):
                 self._respond(400, "Invalid search track")
                 return
             try:
-                self._respond(200, render_page(repository.list_reviews(track=track), csrf_token, notice, track))
+                self._respond(200, render_page(repository.list_reviews(track=track), csrf_token, notice, track,
+                                               repository.get_profile()))
             except Exception:
                 self._respond(500, "Could not load the review queue")
 

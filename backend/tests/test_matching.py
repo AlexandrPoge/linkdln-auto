@@ -2,7 +2,7 @@ import unittest
 
 from app.candidate.profile import CandidateProfile
 from app.matching.rules import evaluate
-from app.templates.drafts import render_application
+from app.templates.drafts import render_application, render_linkedin_message
 from app.vacancies.models import Vacancy
 
 
@@ -63,6 +63,17 @@ class MatchingTests(unittest.TestCase):
         profile, job = _profile(contact_email="candidate@example.com"), _job()
         draft = render_application(profile, job, evaluate(profile, job))
         self.assertTrue(draft.endswith("Example Candidate\ncandidate@example.com"))
+
+    def test_linkedin_message_uses_only_matched_skills_and_is_not_an_email(self) -> None:
+        profile, job = _profile(contact_email="candidate@example.com"), _job()
+        message = render_linkedin_message(profile, job, evaluate(profile, job))
+        self.assertIn("AI Automation Engineer opening at Example Ltd", message)
+        self.assertIn("n8n, REST API", message)
+        self.assertNotIn("Go", message)
+        self.assertNotIn("candidate@example.com", message)
+        with self.assertRaises(ValueError):
+            render_linkedin_message(profile, _job(title="Sales Manager"),
+                                    evaluate(profile, _job(title="Sales Manager")))
 
     def test_rejects_office_or_hybrid_when_remote_only(self) -> None:
         for location in ("Berlin, Germany", "Hybrid - Europe", "On-site - Europe"):
