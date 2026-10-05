@@ -1,5 +1,12 @@
 from dataclasses import dataclass
 from typing import Any
+import re
+
+
+def is_email_address(value: str) -> bool:
+    return bool(len(value) <= 254 and re.fullmatch(
+        r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", value
+    ))
 
 
 def _text(value: Any, field: str, *, required: bool = False) -> str:
@@ -30,6 +37,8 @@ class CandidateProfile:
     work_modes: tuple[str, ...]
     salary_min: int | None
     salary_currency: str | None
+    residence_country: str | None
+    contact_email: str | None = None
 
     @classmethod
     def from_dict(cls, value: Any) -> "CandidateProfile":
@@ -48,6 +57,14 @@ class CandidateProfile:
         work_modes = _strings(value.get("work_modes", []), "work_modes")
         if any(mode not in {"remote", "hybrid", "onsite"} for mode in work_modes):
             raise ValueError("work_modes must contain only remote, hybrid, or onsite")
+        residence_country = value.get("residence_country")
+        if residence_country is not None:
+            residence_country = _text(residence_country, "residence_country", required=True)
+        contact_email = value.get("contact_email")
+        if contact_email is not None:
+            contact_email = _text(contact_email, "contact_email", required=True)
+            if not is_email_address(contact_email):
+                raise ValueError("contact_email must be a valid email address")
         return cls(
             full_name=_text(value.get("full_name"), "full_name", required=True),
             resume_text=_text(value.get("resume_text", ""), "resume_text"),
@@ -57,6 +74,8 @@ class CandidateProfile:
             work_modes=work_modes,
             salary_min=salary_min,
             salary_currency=salary_currency,
+            residence_country=residence_country,
+            contact_email=contact_email,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -69,4 +88,6 @@ class CandidateProfile:
             "work_modes": list(self.work_modes),
             "salary_min": self.salary_min,
             "salary_currency": self.salary_currency,
+            "residence_country": self.residence_country,
+            "contact_email": self.contact_email,
         }

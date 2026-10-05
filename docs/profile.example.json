@@ -1,10 +1,12 @@
 {
   "full_name": "Example Candidate",
   "resume_text": "Short factual summary of experience and achievements.",
-  "roles": ["Software Engineer"],
-  "countries": ["United States"],
-  "skills": ["Python", "PostgreSQL"],
-  "work_modes": ["remote", "hybrid"],
+  "roles": ["AI Automation Engineer", "Automation Developer"],
+  "countries": ["Europe"],
+  "skills": ["Go", "n8n", "REST API", "Webhooks"],
+  "work_modes": ["remote"],
+  "residence_country": null,
+  "contact_email": null,
   "salary_min": null,
   "salary_currency": null
 }

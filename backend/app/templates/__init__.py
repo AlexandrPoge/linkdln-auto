@@ -1,0 +1,1 @@
+"""Fact-based application templates."""

@@ -12,6 +12,8 @@ class CandidateProfileTests(unittest.TestCase):
             "countries": ["United Kingdom"],
             "skills": ["Python", "Python"],
             "work_modes": ["remote"],
+            "residence_country": "United Kingdom",
+            "contact_email": "ada@example.com",
             "salary_min": 100000,
             "salary_currency": "gbp",
         })
@@ -19,6 +21,8 @@ class CandidateProfileTests(unittest.TestCase):
         self.assertEqual(profile.roles, ("Engineer",))
         self.assertEqual(profile.skills, ("Python",))
         self.assertEqual(profile.salary_currency, "GBP")
+        self.assertEqual(profile.residence_country, "United Kingdom")
+        self.assertEqual(profile.contact_email, "ada@example.com")
         self.assertEqual(profile.to_dict()["roles"], ["Engineer"])
         self.assertEqual(CandidateProfile.from_dict(profile.to_dict()), profile)
 
@@ -28,3 +32,5 @@ class CandidateProfileTests(unittest.TestCase):
             CandidateProfile.from_dict(base | {"salary_min": 100000})
         with self.assertRaisesRegex(ValueError, "work_modes"):
             CandidateProfile.from_dict(base | {"work_modes": ["anywhere"]})
+        with self.assertRaisesRegex(ValueError, "contact_email"):
+            CandidateProfile.from_dict(base | {"contact_email": "not-an-address"})
