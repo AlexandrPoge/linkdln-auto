@@ -9,5 +9,6 @@
 5. **Sending and history (email path implemented, not configured):** approved drafts can be emailed only to an explicitly entered employer address after local SMTP and resume settings are supplied. Preview is the default, actual delivery requires `--execute`, and one-attempt claims plus outcome history block automatic retries. ATS-form and LinkedIn submissions are not implemented.
 6. **Additional sources:** add further adapters one at a time after validating their access rules and reliability.
 7. **LinkedIn-assisted workflow (drafts implemented):** generate a short, unsent recruiter message for matched vacancies; use LinkedIn's own Job Alerts for discovery. The app does not scrape LinkedIn, read its messages, or send messages on the member's behalf. Connecting alerts to the local queue would require a supported data path and a real alert sample for validation.
+7a. **LinkedIn alert email intake (offline inspection implemented):** inspect a saved `.eml` for direct job links without mailbox credentials or website access. A real sample is required before adding an importer, automatic mailbox polling, or matching; link labels alone are not enough to verify remote eligibility.
 
 Each stage should be reviewed and tested before beginning the next one.

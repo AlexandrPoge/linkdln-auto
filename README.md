@@ -56,6 +56,15 @@ Open `http://127.0.0.1:8765/` after `serve` starts, then click **Обновит�
 
 For active matched vacancies, the page also shows a short, read-only LinkedIn message based on the current saved profile. This text is separate from the editable email application and is never sent by the app. See [docs/linkedin.md](docs/linkedin.md) for LinkedIn's native job alerts and the platform boundary.
 
+The first LinkedIn-alert integration step can inspect a locally saved `.eml` notification without logging in, fetching job pages, importing vacancies, or sending anything:
+
+```sh
+cd backend
+../.venv/bin/python -m app inspect-linkedin-alert ../data/linkedin-alert.eml
+```
+
+The command needs no database or email credentials. It extracts only direct LinkedIn job links and unverified anchor labels; a real alert sample is still needed before this can become a reliable queue importer. Keep original alert emails in the Git-ignored `data/` directory because they may contain personal tracking links.
+
 ## Email delivery (opt-in)
 
 For an approved draft, enter **the application email explicitly published by that employer** in the local review page. Do not guess HR addresses. Configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURITY` (`ssl` or `starttls`), `SMTP_USERNAME`, `SMTP_PASSWORD`, and the absolute `RESUME_PDF_PATH` locally; the resume must be a PDF of at most 5 MB. `SMTP_FROM` may be set explicitly or taken from the locally saved profile's `contact_email`. Never commit credentials or the personal profile file. The sender email must be an address you control, so employers can reply. The generated resume is separate from the repository at `../pdf/Aliaksandr_Poge_AI_Automation_Resume.pdf`; review it before using it in real applications.

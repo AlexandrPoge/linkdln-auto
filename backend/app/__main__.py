@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from app.integrations.email_sender import SMTPApplicationSender, SMTPSettings
 from app.integrations.job_sources.ashby import AshbySourceError, fetch_board as fetch_ashby_board
 from app.integrations.job_sources.greenhouse import SourceError, fetch_board
 from app.integrations.job_sources.himalayas import HimalayasSourceError, fetch_search
+from app.integrations.job_sources.linkedin_alert import parse_alert_email
 from app.matching.rules import evaluate
 from app.templates.drafts import render_application, render_linkedin_message
 from app.vacancies.models import SEARCH_TRACKS, Vacancy
@@ -55,7 +57,20 @@ def main() -> int:
     delivery.add_argument("--track", choices=SEARCH_TRACKS)
     delivery.add_argument("--limit", type=int, default=10)
     delivery.add_argument("--execute", action="store_true", help="Actually send emails; omitted by default")
+    alert = commands.add_parser("inspect-linkedin-alert", help="Inspect a saved .eml; does not import or send")
+    alert.add_argument("file", type=Path, help="Locally saved LinkedIn Job Alert .eml file")
     args = parser.parse_args()
+
+    if args.command == "inspect-linkedin-alert":
+        try:
+            links = parse_alert_email(args.file.read_bytes())
+            print(json.dumps({"job_links": [asdict(link) for link in links], "count": len(links),
+                              "note": "Unverified email contents; no vacancy imported or message sent."},
+                             ensure_ascii=False, indent=2))
+        except (OSError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        return 0
 
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
