@@ -5,6 +5,11 @@ from app.candidate.profile import CandidateProfile
 from app.vacancies.models import Vacancy
 
 _GENERIC_ROLE_WORDS = {"ai", "engineer", "developer", "software", "specialist", "разработчик", "инженер"}
+_ROLE_TYPES = {
+    "engineer": re.compile(r"\b(engineer|engineering|инженер\w*)\b", re.IGNORECASE),
+    "developer": re.compile(r"\b(developer|разработчик\w*)\b", re.IGNORECASE),
+    "specialist": re.compile(r"\b(specialist|специалист\w*)\b", re.IGNORECASE),
+}
 _REMOTE = re.compile(r"\b(remote|fully distributed|work from anywhere|home[ -]?office|удал[её]н\w*)\b", re.IGNORECASE)
 _NEGATED_REMOTE = re.compile(r"\b(no|not)\s+remote\b", re.IGNORECASE)
 _OFFICE = re.compile(r"\b(on[ -]?site|office|hybrid|гибрид\w*|офис\w*)\b", re.IGNORECASE)
@@ -18,6 +23,10 @@ _RESIDENCE_ALIASES = {"united kingdom": ("UK",), "united states": ("US", "USA")}
 
 def _words(value: str) -> set[str]:
     return set(re.findall(r"\w+", value.casefold()))
+
+
+def _role_types(value: str) -> set[str]:
+    return {name for name, pattern in _ROLE_TYPES.items() if pattern.search(value)}
 
 
 def _contains_phrase(text: str, phrase: str) -> bool:
@@ -97,6 +106,9 @@ def evaluate(profile: CandidateProfile, vacancy: Vacancy) -> MatchResult:
     shared_terms = role_terms & _words(title)
     if not exact_role and not shared_terms:
         return MatchResult("rejected", 0, ("Job title does not match target roles.",), (), ())
+    target_types = set().union(*(_role_types(role) for role in profile.roles))
+    if not exact_role and target_types and not target_types.intersection(_role_types(title)):
+        return MatchResult("rejected", 0, ("Job title does not match the target role type.",), (), ())
 
     remote_only = profile.work_modes == ("remote",)
     location = vacancy.location.casefold()
@@ -154,7 +166,6 @@ def evaluate(profile: CandidateProfile, vacancy: Vacancy) -> MatchResult:
     else:
         warnings.append("No listed profile skills were found in the vacancy; check technical requirements.")
     if _SENIOR_TITLE.search(vacancy.title):
-        score -= 15
         warnings.append("Senior or leadership title: verify the required experience before approval.")
 
     target_locations = [country for country in profile.countries if _contains_phrase(location, country)]

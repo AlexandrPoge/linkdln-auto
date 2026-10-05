@@ -29,6 +29,23 @@ def _job(**overrides: object) -> Vacancy:
 
 
 class MatchingTests(unittest.TestCase):
+    def test_automation_engineer_focus_rejects_backend_titles_despite_shared_skills(self) -> None:
+        profile = _profile(roles=["Automation Engineer"])
+        backend = _job(title="Senior Backend Engineer", description="Build Go APIs and n8n workflows.")
+        self.assertEqual(evaluate(profile, backend).status, "rejected")
+        self.assertEqual(evaluate(profile, _job(title="Automation Engineer")).status, "review")
+        self.assertEqual(evaluate(profile, _job(title="Automation Specialist")).status, "rejected")
+        self.assertEqual(evaluate(profile, _job(title="Automation Developer")).status, "rejected")
+        self.assertEqual(evaluate(profile, _job(title="Engineer, Automation Systems")).status, "review")
+
+    def test_senior_automation_title_is_not_given_a_scoring_penalty(self) -> None:
+        profile = _profile(roles=["Automation Engineer"])
+        regular = evaluate(profile, _job(title="Automation Engineer"))
+        senior = evaluate(profile, _job(title="Senior Automation Engineer"))
+        self.assertEqual(senior.status, "review")
+        self.assertEqual(senior.score, regular.score)
+        self.assertTrue(any("required experience" in warning for warning in senior.warnings))
+
     def test_remote_europe_role_produces_ranked_review_and_factual_draft(self) -> None:
         profile, job = _profile(), _job()
         result = evaluate(profile, job)
