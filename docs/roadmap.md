@@ -10,5 +10,6 @@
 6. **Additional sources:** add further adapters one at a time after validating their access rules and reliability.
 7. **LinkedIn-assisted workflow (drafts implemented):** generate a short, unsent recruiter message for matched vacancies; use LinkedIn's own Job Alerts for discovery. The app does not scrape LinkedIn, read its messages, or send messages on the member's behalf. Connecting alerts to the local queue would require a supported data path and a real alert sample for validation.
 7a. **LinkedIn alert email intake (offline inspection implemented):** inspect a saved `.eml` for direct job links without mailbox credentials or website access. A real sample is required before adding an importer, automatic mailbox polling, or matching; link labels alone are not enough to verify remote eligibility.
+8. **Batch search (implemented, unscheduled):** one `sync` command imports configured public sources and refreshes both local review queues. It reports partial source failures without closing jobs from a failed fetch and never sends applications. Scheduling and LinkedIn alert mailbox integration require separate setup and validation.
 
 Each stage should be reviewed and tested before beginning the next one.

@@ -20,6 +20,7 @@ from app.integrations.job_sources.linkedin_alert import parse_alert_email
 from app.matching.rules import evaluate
 from app.templates.drafts import render_application, render_linkedin_message
 from app.vacancies.models import SEARCH_TRACKS, Vacancy
+from app.vacancies.sync import parse_search_plan, run_searches
 
 
 def _json_default(value: object) -> str:
@@ -59,6 +60,8 @@ def main() -> int:
     delivery.add_argument("--execute", action="store_true", help="Actually send emails; omitted by default")
     alert = commands.add_parser("inspect-linkedin-alert", help="Inspect a saved .eml; does not import or send")
     alert.add_argument("file", type=Path, help="Locally saved LinkedIn Job Alert .eml file")
+    sync = commands.add_parser("sync", help="Fetch configured public sources and refresh unsent review queues")
+    sync.add_argument("--config", type=Path, required=True, help="JSON search configuration")
     args = parser.parse_args()
 
     if args.command == "inspect-linkedin-alert":
@@ -85,6 +88,14 @@ def main() -> int:
         elif args.command == "profile":
             saved = repository.get_profile()
             print(json.dumps(saved.to_dict() if saved else None, ensure_ascii=False, indent=2))
+        elif args.command == "sync":
+            config_bytes = args.config.read_bytes()
+            if len(config_bytes) > 64_000:
+                raise ValueError("search config exceeds 64 KB")
+            plan = parse_search_plan(json.loads(config_bytes))
+            result = run_searches(repository, plan)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 1 if result["failed"] else 0
         elif args.command == "import":
             if args.source == "himalayas":
                 saved = repository.get_profile()

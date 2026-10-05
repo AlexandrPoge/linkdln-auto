@@ -20,7 +20,7 @@ Candidate profiles and vacancies are stored in PostgreSQL. The local CLI imports
 
 See [docs/architecture.md](docs/architecture.md) for module boundaries and [docs/roadmap.md](docs/roadmap.md) for the staged implementation.
 
-## Run stages 2–4 locally
+## Run locally
 
 Requires Python 3.11+ and Docker. The compose file exposes PostgreSQL only on localhost with development credentials; do not use them in a deployed environment.
 
@@ -36,6 +36,7 @@ cd backend
 ../.venv/bin/python -m app import greenhouse YOUR_BOARD_TOKEN
 ../.venv/bin/python -m app import ashby n8n --company n8n
 ../.venv/bin/python -m app import himalayas BY --query 'AI Automation Specialist'
+../.venv/bin/python -m app sync --config ../data/searches.json
 ../.venv/bin/python -m app vacancies --limit 20 --track belarus
 ../.venv/bin/python -m app matches --limit 50 --track international
 ../.venv/bin/python -m app serve --port 8765
@@ -43,6 +44,8 @@ cd backend
 ```
 
 The `data/` directory is ignored by Git. A local `data/profile.json` based on the confirmed LinkedIn/hh.ru facts is already prepared in this checkout; review it before loading. In a fresh clone, create it from `docs/profile.example.json` and replace all example values. `countries` contains target search regions, while `residence_country` records where the candidate actually lives for eligibility warnings. The profile is stored in local PostgreSQL; do not commit personal profile files or expose this database to the internet. `YOUR_BOARD_TOKEN` is the final segment of a company's Greenhouse board URL. The Greenhouse importer uses its [public Job Board API](https://docs.greenhouse.io/job-board.html), fetches full descriptions, and skips prospect posts. The Ashby importer uses its [public Job Postings API](https://developers.ashbyhq.com/docs/public-job-posting-api), imports only listed jobs, and preserves the board's stated remote locations. Both update existing jobs and mark jobs missing from a successful full-board fetch as closed, independently per source and board.
+
+`sync --config ../data/searches.json` is the repeatable one-command search: it fetches each configured public source, updates the database, and refreshes the Belarus and international review queues. It never approves or sends an application. The local `data/searches.json` currently includes n8n's Ashby board and a Belarus-scoped Himalayas query; a template is in [docs/searches.example.json](docs/searches.example.json). Failed sources are reported individually and are not treated as a reason to close their previous listings. `sync` runs once when invoked; a daily or hourly schedule is **not yet installed**. Do not put passwords in the search config.
 
 The Himalayas importer uses its [public Remote Jobs API](https://himalayas.app/docs/remote-jobs-api). The current CLI search supports the saved Belarus profile with country code `BY`. By default it excludes jobs the aggregator labels only as worldwide and keeps those whose published location restrictions explicitly include Belarus. `--include-worldwide` is optional, but it does **not** verify employer eligibility. Himalayas is an aggregator, so its classification is never treated as confirmation from the employer; the review page shows source attribution and a warning. Search imports do not close missing jobs because search results can shift or be incomplete; verify that a posting is still live before approval. Do not republish these listings to other job sites.
 
