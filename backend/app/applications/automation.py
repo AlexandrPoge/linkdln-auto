@@ -14,9 +14,13 @@ from app.integrations.email_sender import SMTPApplicationSender, SMTPSettings, s
 from app.integrations.mailbox import collect_alerts
 from app.integrations.gmail_api import GmailOAuth, GmailApplicationSender, GmailAPIError
 from app.matching.rules import evaluate
+from app.matching.screening import screen
 from app.templates.drafts import render_application
 from app.vacancies.models import Vacancy
 from app.vacancies.sync import run_searches
+from app.vacancies.alert_screening import check_alert_leads
+from app.vacancies.screening import screen_saved_vacancies
+from app.applications.queue import refresh_queue
 
 
 @dataclass(frozen=True, repr=False)
@@ -124,6 +128,8 @@ def automatic_candidate(profile, row: dict) -> str | None:
         return None
     job = Vacancy(**{name: row[name] for name in Vacancy.__dataclass_fields__ if name in row})
     result = evaluate(profile, job)
+    if screen(profile, job).status != "matched":
+        return None
     if result.status != "review" or result.score < 75 or len(result.matched_skills) < 2:
         return None
     if not re.search(r"\bremote\s*[-,].*\b(?:Belarus|Worldwide|Anywhere|Global)\b", job.location, re.I):
@@ -159,11 +165,9 @@ class AutomationPipeline:
                                   "mailbox": "not connected",
                                   "auto_approved": 0, "applications": "not connected", "digest": "not connected"}
         report["automation"] = stages
-        # Durable pending notifications also accumulate before the account is connected.
-        repository.enqueue_notifications()
-        if not connected:
-            return report
-        if settings.mailbox:
+        if profile is None:
+            raise ValueError("candidate profile is missing")
+        if connected and settings.mailbox:
             try:
                 stages["mailbox"] = (self.oauth.collect_alerts(repository) if api_connected else
                                      collect_alerts(repository, settings.email, settings.password))
@@ -172,7 +176,16 @@ class AutomationPipeline:
             except Exception:
                 stages["mailbox"] = "failed: check Gmail access; other stages continue"
         else:
-            stages["mailbox"] = "disabled"
+            stages["mailbox"] = "disabled" if connected else "not connected"
+        # Screening runs even with mail disconnected; no send is needed to verify intake.
+        stages["alert_screening"] = check_alert_leads(repository, profile)
+        stages["screening"] = screen_saved_vacancies(repository, profile)
+        if stages["alert_screening"]["resolved"]:
+            for track in ("belarus", "international"):
+                refresh_queue(repository, track=track)
+        repository.enqueue_notifications()
+        if not connected:
+            return report
         if settings.send_applications:
             try:
                 if api_connected:
@@ -205,7 +218,8 @@ class AutomationPipeline:
                 if not items:
                     stages["digest"] = {"sent": 0, "items": 0}
                 else:
-                    body = "Новые вакансии и ссылки для Automation Engineer\n\n" + "\n\n".join(
+                    body = ("Вакансии Automation Engineer, прошедшие проверку описания\n"
+                            "Совпадение по опубликованному тексту не гарантирует юридическую возможность найма.\n\n") + "\n\n".join(
                         f"{item['title']}\n{item['source']} · {item['kind']}\n{item['url']}" for item in items)
                     try:
                         subject = f"Поиск работы: {len(items)} новых предложений"
@@ -234,4 +248,6 @@ class AutomationPipeline:
                 "notifications": settings.notifications, "mailbox": settings.mailbox,
                 "send_applications": settings.send_applications, "auto_approve": settings.auto_approve,
                 "daily_limit": settings.daily_limit, **self.repository.automation_stats(),
+                "alert_screening": self.repository.alert_screening_stats(),
+                "screening_counts": self.repository.vacancy_screening_stats(),
                 "leads": self.repository.list_alert_leads(20)}

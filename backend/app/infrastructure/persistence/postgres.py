@@ -11,6 +11,22 @@ from app.applications.delivery import is_email_address
 from app.candidate.profile import CandidateProfile
 from app.vacancies.models import SEARCH_TRACKS, Vacancy
 
+# Eligibility expires when profile or vacancy evidence changes. No mailbox label
+# can satisfy this join. Reuse it for both outbox claims and dashboard counters.
+_CURRENT_SCREENING = """
+    JOIN vacancy_screenings AS s ON s.vacancy_id = v.id
+    JOIN candidate_profiles AS p ON p.id = 1 AND p.data = s.profile_data
+    WHERE s.status = 'matched' AND v.is_active
+      AND v.last_seen_at > now() - interval '24 hours'
+      AND s.evidence <@ to_jsonb(v)
+"""
+_ELIGIBLE_NOTIFICATION = f"""EXISTS (
+    SELECT 1 FROM vacancies AS v {_CURRENT_SCREENING}
+      AND v.source = n.source AND v.external_id = n.external_id
+      AND NOT EXISTS (SELECT 1 FROM application_reviews AS r
+                      WHERE r.vacancy_id = v.id AND r.status = 'rejected')
+)"""
+
 
 class Repository:
     def __init__(self, database_url: str) -> None:
@@ -125,9 +141,27 @@ class Repository:
                     UNIQUE(source, external_id)
                 )
             """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS vacancy_screenings (
+                    vacancy_id BIGINT PRIMARY KEY REFERENCES vacancies(id),
+                    status TEXT NOT NULL CHECK(status IN ('matched','manual','rejected')),
+                    reason TEXT NOT NULL, evidence JSONB NOT NULL, profile_data JSONB NOT NULL,
+                    checked_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            connection.execute("""
+                ALTER TABLE alert_leads ADD COLUMN IF NOT EXISTS screening_status TEXT NOT NULL
+                    DEFAULT 'pending' CHECK(screening_status IN ('pending','manual','rejected','resolved'))
+            """)
+            connection.execute("ALTER TABLE alert_leads ADD COLUMN IF NOT EXISTS screening_reason TEXT NOT NULL DEFAULT ''")
+            connection.execute("ALTER TABLE alert_leads ADD COLUMN IF NOT EXISTS checked_at TIMESTAMPTZ")
 
     def save_profile(self, profile: CandidateProfile) -> None:
         with self._connect() as connection:
+            current = connection.execute("SELECT data FROM candidate_profiles WHERE id = 1").fetchone()
+            if current and current["data"] != profile.to_dict():
+                connection.execute("""UPDATE alert_leads SET screening_status = 'pending',
+                    screening_reason = '', checked_at = NULL WHERE screening_status != 'resolved'""")
             connection.execute("""
                 INSERT INTO candidate_profiles (id, data) VALUES (1, %s::jsonb)
                 ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()
@@ -345,41 +379,83 @@ class Repository:
         with self._connect() as connection:
             return [dict(row) for row in connection.execute("SELECT * FROM alert_leads ORDER BY first_seen_at DESC, id DESC LIMIT %s", (limit,)).fetchall()]
 
+    def alert_screening_stats(self) -> dict:
+        with self._connect() as connection:
+            return {row["screening_status"]: row["n"] for row in connection.execute(
+                "SELECT screening_status, count(*) AS n FROM alert_leads GROUP BY screening_status").fetchall()}
+
+    def vacancy_screening_stats(self) -> dict:
+        with self._connect() as connection:
+            return {row["status"]: row["n"] for row in connection.execute("""
+                SELECT s.status, count(*) AS n FROM vacancies AS v
+                JOIN vacancy_screenings AS s ON s.vacancy_id = v.id
+                JOIN candidate_profiles AS p ON p.id = 1 AND p.data = s.profile_data
+                WHERE v.is_active AND s.evidence <@ to_jsonb(v)
+                GROUP BY s.status
+            """).fetchall()}
+
+    def list_alert_leads_to_check(self, limit: int = 500) -> list[dict]:
+        if not 1 <= limit <= 500:
+            raise ValueError("lead check limit must be 1 to 500")
+        with self._connect() as connection:
+            return [dict(row) for row in connection.execute("""
+                SELECT * FROM alert_leads WHERE screening_status = 'pending'
+                    OR (source = 'hh' AND screening_status = 'manual' AND checked_at < now() - interval '6 hours')
+                ORDER BY id LIMIT %s
+            """, (limit,)).fetchall()]
+
+    def finish_alert_screening(self, lead_id: int, status: str, reason: str) -> None:
+        if status not in {"manual", "rejected", "resolved"} or not reason or len(reason) > 1000:
+            raise ValueError("invalid alert screening result")
+        with self._connect() as connection:
+            connection.execute("UPDATE alert_leads SET screening_status = %s, screening_reason = %s, checked_at = now() WHERE id = %s",
+                               (status, reason, lead_id))
+
+    def save_screening(self, vacancy_id, result, evidence: dict, profile: CandidateProfile) -> bool:
+        with self._connect() as connection:
+            return connection.execute("""
+                INSERT INTO vacancy_screenings(vacancy_id, status, reason, evidence, profile_data)
+                SELECT v.id, %s, %s, %s::jsonb, %s::jsonb FROM vacancies AS v
+                JOIN candidate_profiles AS p ON p.id = 1
+                WHERE v.id = %s AND v.is_active AND %s::jsonb <@ to_jsonb(v) AND p.data = %s::jsonb
+                ON CONFLICT(vacancy_id) DO UPDATE SET status = EXCLUDED.status, reason = EXCLUDED.reason,
+                    evidence = EXCLUDED.evidence, profile_data = EXCLUDED.profile_data, checked_at = now()
+            """, (result.status, result.reason, json.dumps(evidence), json.dumps(profile.to_dict()), vacancy_id,
+                  json.dumps(evidence), json.dumps(profile.to_dict()))).rowcount == 1
+
     def auto_approve_review(self, row: dict, recipient: str) -> int:
         if not is_email_address(recipient):
             raise ValueError("invalid published application email")
         with self._connect() as connection:
-            return connection.execute("""
+            return connection.execute(f"""
                 UPDATE application_reviews AS r SET status = 'approved', approved_at = now(),
                     recipient_email = %s, updated_at = now()
-                FROM vacancies AS v WHERE r.id = %s AND r.vacancy_id = v.id AND v.is_active
+                FROM vacancies AS v {_CURRENT_SCREENING}
+                    AND r.id = %s AND r.vacancy_id = v.id
                     AND r.status = 'draft' AND r.draft_text = %s AND v.description = %s AND v.location = %s AND v.title = %s
             """, (recipient, row["id"], row["draft_text"], row["description"], row["location"], row["title"])).rowcount
 
     def enqueue_notifications(self) -> None:
         with self._connect() as connection:
-            connection.execute("""
+            connection.execute(f"""
                 INSERT INTO job_notifications(source, external_id, title, url, kind)
-                SELECT v.source, v.external_id, v.title || ' — ' || v.company, v.url, 'Прошла первичный фильтр'
-                FROM application_reviews AS r JOIN vacancies AS v ON v.id = r.vacancy_id
-                WHERE r.status != 'rejected' AND v.is_active
-                ON CONFLICT(source, external_id) DO NOTHING
-            """)
-            connection.execute("""
-                INSERT INTO job_notifications(source, external_id, title, url, kind)
-                SELECT source, external_id, title, url, 'Ссылка из письма; условия не проверены' FROM alert_leads
-                ON CONFLICT(source, external_id) DO NOTHING
+                SELECT DISTINCT ON (v.source, v.external_id)
+                    v.source, v.external_id, v.title || ' — ' || v.company, v.url, 'Прошла проверку описания'
+                FROM vacancies AS v {_CURRENT_SCREENING}
+                  AND NOT EXISTS (SELECT 1 FROM application_reviews AS r WHERE r.vacancy_id = v.id AND r.status = 'rejected')
+                ORDER BY v.source, v.external_id, v.last_seen_at DESC, v.id DESC
+                ON CONFLICT(source, external_id) DO UPDATE SET
+                    title = EXCLUDED.title, url = EXCLUDED.url, kind = EXCLUDED.kind
+                WHERE job_notifications.status = 'pending'
             """)
 
     def claim_notifications(self, limit: int = 25) -> list[dict]:
         if not 1 <= limit <= 25:
             raise ValueError("notification limit must be 1 to 25")
         with self._connect() as connection:
-            rows = connection.execute("""
+            rows = connection.execute(f"""
                 WITH pending AS (SELECT n.id FROM job_notifications AS n WHERE n.status = 'pending'
-                    AND (n.kind = 'Ссылка из письма; условия не проверены' OR EXISTS (
-                        SELECT 1 FROM application_reviews AS r JOIN vacancies AS v ON v.id = r.vacancy_id
-                        WHERE v.source = n.source AND v.external_id = n.external_id AND v.is_active AND r.status != 'rejected'))
+                    AND {_ELIGIBLE_NOTIFICATION}
                     ORDER BY n.id LIMIT %s FOR UPDATE OF n SKIP LOCKED)
                 UPDATE job_notifications AS n SET status = 'sending' FROM pending
                 WHERE n.id = pending.id RETURNING n.*
@@ -393,10 +469,11 @@ class Repository:
     def automation_stats(self) -> dict:
         with self._connect() as connection:
             sent = connection.execute("SELECT count(*) AS n FROM application_delivery_attempts WHERE status = 'sent'").fetchone()["n"]
-            pending = connection.execute("SELECT count(*) AS n FROM job_notifications WHERE status = 'pending'").fetchone()["n"]
+            pending = connection.execute(f"SELECT count(*) AS n FROM job_notifications AS n WHERE n.status = 'pending' AND {_ELIGIBLE_NOTIFICATION}").fetchone()["n"]
+            held = connection.execute(f"SELECT count(*) AS n FROM job_notifications AS n WHERE n.status = 'pending' AND NOT ({_ELIGIBLE_NOTIFICATION})").fetchone()["n"]
             uncertain = connection.execute("SELECT count(*) AS n FROM application_delivery_attempts WHERE status IN ('uncertain','sending')").fetchone()["n"]
             uncertain += connection.execute("SELECT count(*) AS n FROM job_notifications WHERE status IN ('uncertain','sending')").fetchone()["n"]
-        return {"sent_total": sent, "notification_pending": pending, "uncertain_total": uncertain}
+        return {"sent_total": sent, "notification_pending": pending, "notification_held": held, "uncertain_total": uncertain}
 
     def finish_delivery(self, attempt_id: int, *, sent: bool, reference: str = "", error: str = "") -> None:
         if attempt_id <= 0:

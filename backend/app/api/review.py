@@ -15,6 +15,7 @@ from app.integrations.gmail_api import GmailAPIError
 from app.candidate.profile import CandidateProfile
 from app.infrastructure.persistence.postgres import Repository
 from app.matching.rules import evaluate
+from app.matching.screening import screen
 from app.templates.drafts import render_linkedin_message
 from app.vacancies.models import SEARCH_TRACKS
 from app.vacancies.models import Vacancy
@@ -52,11 +53,31 @@ def _display_reason(reason: str) -> str:
         "Location is listed as office-based or hybrid.": "Вакансия офисная или гибридная.",
         "Remote work is not confirmed.": "Удалённая работа не подтверждена.",
         "Listed remote locations are outside the target European region.": "География удалённой работы вне целевого региона.",
+        "Senior/lead role is outside the automatic search focus.": "Senior/Lead вне текущего автоматического поиска.",
+        "Full description is missing or too short to verify responsibilities.": "Нет полного описания для проверки обязанностей.",
+        "Business/workflow automation responsibilities are not confirmed.": "Автоматизация бизнес-процессов в обязанностях не подтверждена.",
+        "Description concerns test or industrial automation, not business workflows.": "В описании — тестовая или промышленная автоматизация, не бизнес-процессы.",
+        "Fewer than two profile skills are confirmed in the description.": "Подтверждено меньше двух навыков из профиля.",
+        "Fully remote work needs confirmation; office/hybrid or description-only evidence.": "Нужно подтвердить полностью удалённый формат: есть офис/гибрид или только упоминание в описании.",
+        "Country of residence is not configured.": "Страна проживания не настроена.",
+        "EU/EEA residence or citizenship is required; Belarus does not satisfy that scope.": "Требуется проживание/гражданство ЕС или ЕЭЗ; Беларусь не входит в этот регион.",
+        "Description restricts hiring to other countries.": "В описании найм ограничен другими странами.",
+        "Residence/work-authorization restrictions need human confirmation.": "Ограничения по проживанию или разрешению на работу требуют проверки.",
+        "Remote Europe/EMEA or a listing region does not confirm hiring from your residence.": "Europe/EMEA или регион публикации не подтверждает возможность работать из Беларуси.",
+        "Minimum salary has not been verified.": "Минимальная зарплата не проверена.",
+        "Required years of experience are not verified against the candidate profile.": "Требуемый стаж нужно сверить с фактическим опытом кандидата.",
+        "Role, workflow responsibilities, skills and remote residence scope match the published text.": "По тексту совпали роль, автоматизация процессов, навыки и география удалённой работы.",
+        "Only an alert link is available; full description and hiring scope are not verified.": "Есть только ссылка: описание и география найма не проверены.",
+        "hh description unavailable; bounded API limit/cooldown, retry later.": "Описание hh пока недоступно: лимит или пауза между API-запросами.",
+        "hh vacancy is archived or not fully remote.": "Вакансия hh в архиве или не полностью удалённая.",
+        "Full description loaded from the official hh API.": "Полное описание загружено через официальный API hh.",
     }
     if reason.startswith("Listed remote locations do not include"):
         return "Указанные страны удалённой работы не включают страну проживания."
     if reason.startswith("The vacancy explicitly excludes applicants from"):
         return "Вакансия исключает кандидатов из страны проживания."
+    if reason.startswith("Unverified alert title: "):
+        return "По заголовку письма: " + _display_reason(reason.removeprefix("Unverified alert title: "))
     return translations.get(reason, reason)
 
 
@@ -109,14 +130,25 @@ def _automation_panel(state: dict | None, csrf: str, track: str, profile: Candid
         ("mailbox", "Забирать LinkedIn/hh-уведомления из Gmail INBOX"),
         ("send_applications", "Отправлять утверждённые отклики автоматически"),
         ("auto_approve", "Без ручного утверждения: подходящая вакансия + опубликованный адрес для резюме")))
-    leads = "".join(f'<article class="discovery-card"><span class="muted">{_escape(item["source"])}</span>'
-                    f'<h3>{_escape(item["title"])}</h3>{_vacancy_link(item["url"])}</article>'
+    lead_labels = {"pending": "Ожидает проверки", "manual": "Нужна проверка", "rejected": "Отсеяно по письму", "resolved": "Описание получено"}
+    leads = "".join(f'<article class="discovery-card"><span class="muted">{_escape(item["source"])} · '
+                    f'{lead_labels.get(item.get("screening_status", "pending"), "Нужна проверка")}</span>'
+                    f'<h3>{_escape(item["title"])}</h3><p class="reason">{_escape(_display_reason(item.get("screening_reason", "")))}</p>'
+                    f'{_vacancy_link(item["url"])}</article>'
                     for item in state.get("leads", []))
+    screening = state.get("screening_counts", {})
+    alert_stats = state.get("alert_screening", {})
+    alert_summary = " · ".join(f"{lead_labels.get(key, key)}: {value}" for key, value in alert_stats.items())
     return f'''<section class="search-panel"><h2>Автопилот</h2>
 <p class="run-status {'ok' if connected else 'error'}">{'Gmail API подключён · HTTPS' if oauth['connected'] else 'Gmail подключён · старый SMTP-канал' if connected else 'Поиск работает · почта пока не подключена'}</p>
 <div class="metrics"><div class="metric"><strong>{state['sent_total']}</strong><span>Откликов отправлено</span></div>
 <div class="metric"><strong>{state['notification_pending']}</strong><span>Новых предложений ждут доставки</span></div>
 <div class="metric"><strong>{state['uncertain_total']}</strong><span>Неясных результатов — без повторов</span></div></div>
+<h3>Проверка описаний</h3>
+<p class="run-status ok">Подходит по тексту: {screening.get('matched', 0)} · Нужна проверка: {screening.get('manual', 0)} · Отсеяно: {screening.get('rejected', 0)}</p>
+<p class="muted">Подборки содержат только проверенные описания: инженерная автоматизация бизнес-процессов, минимум два навыка, полностью удалённо и явная география Belarus/Worldwide. Europe/EMEA, Senior/Lead, офис/гибрид и неполные данные не проходят автоматический отбор. Совпадение по тексту не гарантирует юридическую возможность найма.</p>
+<p class="muted">Для hh и Himalayas регион публикации/классификация Worldwide не считается подтверждением: нужна явная география в самом описании. Требования к стажу и разрешению на работу проверяются вручную.</p>
+<p class="muted">Старых уведомлений удержано от отправки: {state.get('notification_held', 0)}. История не удалена; непроверенные ссылки не отправляются. {_escape(alert_summary)}</p>
 <p>Поиск → фильтр → сообщение по шаблону → отправка → история. Без AI.</p>
 <p class="muted">Автоутверждение: свежие Greenhouse/Ashby вакансии, минимум 2 совпавших навыка, удалёнка Worldwide или Belarus и один явно опубликованный адрес для отклика. Остальные — в очереди ниже.</p>
 <h3>Gmail без пароля приложения</h3>
@@ -138,7 +170,7 @@ def _automation_panel(state: dict | None, csrf: str, track: str, profile: Candid
 {flags}<p class="muted">OAuth-токены и настройки хранятся локально вне Git с правами 0600, без шифрования. Пароль Google приложению не нужен. После подключения и сохранения настроек включённые этапы могут отправлять письма.</p>
 <button type="submit">{'Сохранить и запустить цикл' if connected else 'Сохранить настройки · продолжить без почты'}</button></form></details>
 <p class="muted">Ссылки из уведомлений не считаются проверенными вакансиями. Чтобы LinkedIn поступал сюда, включи его Job Alerts с доставкой на этот Gmail. Прямые LinkedIn-сообщения и ATS-формы этот канал не отправляет.</p>
-{'<h3>Из почтовых уведомлений</h3><div class="discovery-list">' + leads + '</div>' if leads else ''}</section>'''
+{'<details><summary>Ссылки из почтовых уведомлений · не проверенные вакансии</summary><div class="discovery-list">' + leads + '</div></details>' if leads else ''}</section>'''
 
 
 def _discovered_vacancies(rows: list[dict[str, Any]], profile: CandidateProfile | None) -> tuple[str, int]:
@@ -148,12 +180,11 @@ def _discovered_vacancies(rows: list[dict[str, Any]], profile: CandidateProfile 
     matching = 0
     for row in rows:
         job = Vacancy(**{field: row[field] for field in Vacancy.__dataclass_fields__ if field in row})
-        result = evaluate(profile, job)
-        possible = result.status == "review"
+        result = screen(profile, job)
+        possible = result.status == "matched"
         matching += possible
-        label = "На проверку" if possible else "Отсеяно"
-        reason = result.warnings[0] if possible and result.warnings else result.reasons[0] if result.reasons else ""
-        reason = _display_reason(reason)
+        label = {"matched": "Подходит по тексту", "manual": "Нужна проверка", "rejected": "Отсеяно"}[result.status]
+        reason = _display_reason(result.reason)
         title = job.title.casefold()
         relevance = (5 if re.search(r"automat|автомат|workflow|integration|интеграц", title) else 0)
         relevance += 2 if re.search(r"\b(ai|agentic|rpa|n8n)\b", title) else 0
@@ -202,12 +233,16 @@ def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
         warnings = "".join(f"<li>{_escape(_display_reason(item))}</li>" for item in row["warnings"])
         reasons = "".join(f"<li>{_escape(_display_reason(item))}</li>" for item in row["reasons"])
         linkedin_draft = ""
+        screening_note = ""
         if profile is not None and row["is_active"]:
             job = Vacancy(source=row.get("source", "manual"), board_token="review", external_id=str(review_id),
                           company=row["company"], title=row["title"], location=row["location"],
                           description=row["description"], url=row["url"], source_updated_at=None,
                           search_track=track)
             result = evaluate(profile, job)
+            screened = screen(profile, job)
+            style = "run-status ok" if screened.status == "matched" else "warning"
+            screening_note = f'<p class="{style}">Автофильтр: {_escape(_display_reason(screened.reason))}</p>'
             if result.status == "review":
                 message = render_linkedin_message(profile, job, result)
                 linkedin_draft = (f'<details><summary>Сообщение рекрутеру для LinkedIn · не отправлено</summary>'
@@ -259,6 +294,7 @@ def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
                 <p class="meta">{_escape(row['company'])} · {_escape(row['location'])}</p>
                 <p>{_vacancy_link(str(row['url']))}</p>
                 {source_note}
+                {screening_note}
                 {stale}
                 <details><summary>Почему подобрана · условия проверки</summary><div class="detail-grid"><div><h3>Совпадения</h3><ul>{reasons}</ul></div><div><h3>Проверить вручную</h3><ul>{warnings}</ul></div></div></details>
                 <details><summary>Описание вакансии</summary><p class="description">{_escape(row['description'])}</p></details>
@@ -325,7 +361,7 @@ input[type=password],input[type=text],input[type=number] {{ box-sizing:border-bo
 <p class="subtitle">{'Вакансии, которые источник относит к удалённой работе из Беларуси. Условия подтверждайте у работодателя.' if track == 'belarus' else 'Международный поиск. Возможность работать из Беларуси проверяйте у работодателя; страна компании не подтверждена автоматически.'}</p>
 {notice_html}
 <div class="metrics"><div class="metric"><strong>{len(discovered)}</strong><span>Проверено последних вакансий (до 200)</span></div>
-<div class="metric"><strong>{possible_count}</strong><span>Прошли первичный фильтр</span></div>
+<div class="metric"><strong>{possible_count}</strong><span>Подходят по описанию</span></div>
 <div class="metric"><strong>{draft_ids}</strong><span>Черновиков на проверку</span></div></div>
 <section class="search-panel"><h2>Автоматический поиск</h2>{_search_status(search_status)}{search_button}
 <p class="muted">Greenhouse · Ashby · Himalayas · Remotive · hh. Ошибка одного источника не останавливает остальные.</p></section>
@@ -337,7 +373,7 @@ input[type=password],input[type=text],input[type=number] {{ box-sizing:border-bo
 <form method="post" action="/approve" id="approve-form"><input type="hidden" name="csrf" value="{_escape(csrf_token)}">{track_input}<label class="pick"><input type="checkbox" name="checked" value="yes" required> Я проверил условия вакансий</label><button type="submit">Утвердить выбранные ({draft_ids} доступны)</button></form>
 </div>{cards_html}{archive_html}
 <h2 class="section-title">Что нашлось в источниках</h2>
-<p class="muted">Сначала близкие по теме, остальные — внутри списка. Это сохранённые вакансии; не все источники обновлялись последним запуском. «На проверку» не подтверждает право работать из Беларуси.</p>
+<p class="muted">Сначала близкие по теме, остальные — внутри списка. Это сохранённые вакансии; не все источники обновлялись последним запуском. «Подходит по тексту» — результат фильтра, не гарантия права на работу; «Нужна проверка» не попадает в автоматическую подборку.</p>
 {discovery_html}
 </main></body></html>'''
 

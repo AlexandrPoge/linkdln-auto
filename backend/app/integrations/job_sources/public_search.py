@@ -3,7 +3,7 @@
 import json
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from app.integrations.job_sources.text import plain_text
 from app.vacancies.models import Vacancy
@@ -13,11 +13,16 @@ class PublicSearchError(Exception):
     pass
 
 
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def get_json(url: str) -> dict:
     request = Request(url, headers={"Accept": "application/json",
                                    "User-Agent": "linkdln-auto/0.2 (personal job search)"})
     try:
-        with urlopen(request, timeout=20) as response:
+        with build_opener(_NoRedirect).open(request, timeout=20) as response:
             raw = response.read(10_000_001)
     except HTTPError as exc:
         raise PublicSearchError(f"{urlsplit(url).hostname}: HTTP {exc.code}") from exc
@@ -85,9 +90,25 @@ def normalize_hh(item: dict, key: str) -> Vacancy | None:
     email = contacts.get("email")
     if isinstance(email, str) and email.strip():
         description += "\nApplication email published by employer: " + email.strip()
+    area = item.get("area") or {}
+    if not isinstance(area, dict):
+        raise PublicSearchError("invalid hh publication area")
+    region = area.get("name") or "not stated"
+    if not isinstance(region, str):
+        raise PublicSearchError("invalid hh publication area name")
     return Vacancy("hh", key, job_id, _required((item.get("employer") or {}).get("name"), "employer"),
-                   _required(item.get("name"), "name"), "Remote - Belarus (hh search region)",
-                   description, f"https://hh.ru/vacancy/{job_id}", None, "belarus")
+                   _required(item.get("name"), "name"), f"Remote · hh publication region: {region} (hiring scope unconfirmed)",
+                   description, f"https://hh.ru/vacancy/{job_id}", None,
+                   "belarus" if key.startswith("BY:") or area.get("id") == "16" else "international")
+
+
+def fetch_hh_detail(job_id: str) -> Vacancy | None:
+    if not isinstance(job_id, str) or not job_id.isdigit() or len(job_id) > 20:
+        raise PublicSearchError("invalid hh vacancy id")
+    detail = get_json(f"https://api.hh.ru/vacancies/{job_id}")
+    if str(detail.get("id", "")) != job_id:
+        raise PublicSearchError("hh returned a different vacancy id")
+    return normalize_hh(detail, "alerts")
 
 
 def fetch_hh(query: str) -> tuple[str, list[Vacancy]]:

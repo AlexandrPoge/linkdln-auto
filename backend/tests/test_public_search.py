@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from app.integrations.job_sources.public_search import (
-    PublicSearchError, fetch_hh, fetch_remotive, normalize_hh, normalize_remotive,
+    PublicSearchError, fetch_hh, fetch_hh_detail, fetch_remotive, normalize_hh, normalize_remotive,
 )
 from app.vacancies.sync import parse_search_plan
 
@@ -25,6 +25,22 @@ class PublicSearchTests(unittest.TestCase):
                                     "contacts": {"email": "jobs@example.com"}}, "BY:n8n")
         self.assertEqual(job.search_track, "belarus")
         self.assertIn("Application email published by employer", job.description)
+        self.assertIn("hiring scope unconfirmed", job.location)
+        self.assertNotIn("Remote - Belarus", job.location)
+
+    @patch("app.integrations.job_sources.public_search.get_json")
+    def test_hh_detail_rejects_invalid_or_mismatched_id(self, get):
+        for identity in ("../profile", "1?redirect=localhost", "https://evil.test", "1" * 21):
+            with self.subTest(identity=identity), self.assertRaises(PublicSearchError):
+                fetch_hh_detail(identity)
+        get.assert_not_called()
+        get.return_value = {"id": "2"}
+        with self.assertRaisesRegex(PublicSearchError, "different vacancy"):
+            fetch_hh_detail("1")
+
+    def test_public_api_never_follows_redirects(self):
+        from app.integrations.job_sources.public_search import _NoRedirect
+        self.assertIsNone(_NoRedirect().redirect_request(None, None, 302, "", {}, "http://127.0.0.1/"))
 
     @patch("app.integrations.job_sources.public_search.get_json")
     def test_hh_uses_fixed_public_endpoint_and_remote_by_scope(self, get):

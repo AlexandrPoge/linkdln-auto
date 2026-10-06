@@ -84,6 +84,22 @@ class ReviewPageTests(unittest.TestCase):
         self.assertIn('action="/gmail-connect"', page)
         self.assertIn("7 дней", page)
 
+    def test_screening_dashboard_explains_held_items_and_collapses_mailbox_noise(self):
+        state = {"connected": False, "email": "", "resume_path": "", "daily_limit": 5,
+                 "notifications": True, "mailbox": True, "send_applications": True, "auto_approve": True,
+                 "sent_total": 0, "notification_pending": 1, "notification_held": 164, "uncertain_total": 0,
+                 "oauth": {"connected": False, "client_configured": False},
+                 "screening_counts": {"matched": 1, "manual": 2, "rejected": 4},
+                 "alert_screening": {"manual": 8, "rejected": 10},
+                 "leads": [{"source": "linkedin", "title": "Backend <Engineer>", "url": "https://example.com/1",
+                            "screening_status": "rejected", "screening_reason": "Unverified alert title: Job title does not match target roles."}]}
+        page = render_page([], "csrf", automation_state=state)
+        self.assertIn("Подходит по тексту: 1 · Нужна проверка: 2 · Отсеяно: 4", page)
+        self.assertIn("удержано от отправки: 164", page)
+        self.assertIn('<details><summary>Ссылки из почтовых уведомлений', page)
+        self.assertIn("По заголовку письма: Название не совпадает", page)
+        self.assertIn("Backend &lt;Engineer&gt;", page)
+
     @patch("app.api.review.verify_gmail")
     def test_gmail_form_checks_csrf_then_verifies_without_echoing_password(self, verify):
         from app.applications.automation import AutomationSettings

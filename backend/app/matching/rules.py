@@ -57,6 +57,17 @@ def _skill_key(skill: str) -> str:
     return name
 
 
+def matched_profile_skills(profile: CandidateProfile, text: str) -> tuple[str, ...]:
+    matched: list[str] = []
+    seen: set[str] = set()
+    for skill in profile.skills:
+        key = _skill_key(skill)
+        if key not in seen and _skill_mentioned(text, skill):
+            matched.append(skill)
+            seen.add(key)
+    return tuple(matched)
+
+
 def _remote_scopes(location: str) -> tuple[str, ...]:
     parts = re.split(r";|,\s*(?=remote\b)", location, flags=re.IGNORECASE)
     scopes: list[str] = []
@@ -68,13 +79,15 @@ def _remote_scopes(location: str) -> tuple[str, ...]:
 
 
 def _residence_explicitly_excluded(description: str, residence: str) -> bool:
-    country = re.escape(residence)
+    country = (r"(?:Belarus|Беларус\w*|Белорус\w*)" if residence.casefold() == "belarus"
+               else re.escape(residence))
     before = re.compile(
         rf"\b(?:except|excluding|excluded|not hiring (?:in|from)|cannot hire (?:in|from)|"
-        rf"unable to consider applicants|restricted countries|do not work with|don't work with)\b"
+        rf"unable to consider applicants|restricted countries|do not work with|don't work with|"
+        rf"not available (?:in|to)|кроме|исключая|не рассматриваем|не нанимаем)\b"
         rf"[^.\n]{{0,250}}\b{country}\b", re.IGNORECASE,
     )
-    after = re.compile(rf"\b{country}\b[^.\n]{{0,80}}\b(?:excluded|ineligible|not eligible)\b", re.IGNORECASE)
+    after = re.compile(rf"\b{country}\b[^.\n]{{0,80}}\b(?:excluded|ineligible|not eligible|не рассматриваются)\b", re.IGNORECASE)
     return bool(before.search(description) or after.search(description))
 
 
@@ -96,23 +109,34 @@ class MatchResult:
         }
 
 
-def evaluate(profile: CandidateProfile, vacancy: Vacancy) -> MatchResult:
-    """Rank a vacancy for human review; never decide that an application may be sent."""
-    title = vacancy.title.casefold()
+def title_rejection(profile: CandidateProfile, title: str) -> str | None:
+    """Check only role evidence; a passing title is never a verified vacancy."""
+    title = title.casefold()
     if _INDUSTRIAL_TITLE.search(title) and not any(_INDUSTRIAL_TITLE.search(role) for role in profile.roles):
-        return MatchResult("rejected", 0, ("Industrial automation is outside the target roles.",), (), ())
+        return "Industrial automation is outside the target roles."
     if _MANAGEMENT_TITLE.search(title) and not any(_MANAGEMENT_TITLE.search(role) for role in profile.roles):
-        return MatchResult("rejected", 0, ("Management role is outside the target roles.",), (), ())
+        return "Management role is outside the target roles."
     if _QA_TITLE.search(title) and not any(_QA_TITLE.search(role) for role in profile.roles):
-        return MatchResult("rejected", 0, ("QA/test automation is outside the target roles.",), (), ())
+        return "QA/test automation is outside the target roles."
     exact_role = next((role for role in profile.roles if _contains_phrase(title, role)), None)
     role_terms = set().union(*(_words(role) - _GENERIC_ROLE_WORDS for role in profile.roles))
     shared_terms = role_terms & _words(title)
     if not exact_role and not shared_terms:
-        return MatchResult("rejected", 0, ("Job title does not match target roles.",), (), ())
+        return "Job title does not match target roles."
     target_types = set().union(*(_role_types(role) for role in profile.roles))
     if not exact_role and target_types and not target_types.intersection(_role_types(title)):
-        return MatchResult("rejected", 0, ("Job title does not match the target role type.",), (), ())
+        return "Job title does not match the target role type."
+    return None
+
+
+def evaluate(profile: CandidateProfile, vacancy: Vacancy) -> MatchResult:
+    """Rank a vacancy for human review; never decide that an application may be sent."""
+    title = vacancy.title.casefold()
+    if reason := title_rejection(profile, title):
+        return MatchResult("rejected", 0, (reason,), (), ())
+    exact_role = next((role for role in profile.roles if _contains_phrase(title, role)), None)
+    role_terms = set().union(*(_words(role) - _GENERIC_ROLE_WORDS for role in profile.roles))
+    shared_terms = role_terms & _words(title)
 
     remote_only = profile.work_modes == ("remote",)
     location = vacancy.location.casefold()
@@ -126,7 +150,9 @@ def evaluate(profile: CandidateProfile, vacancy: Vacancy) -> MatchResult:
         return MatchResult("rejected", 0, ("Location is listed as office-based or hybrid.",), (), ())
     if remote_only and not (remote_in_location or _REMOTE.search(description)):
         return MatchResult("rejected", 0, ("Remote work is not confirmed.",), (), ())
-    if profile.residence_country and _residence_explicitly_excluded(vacancy.description, profile.residence_country):
+    if profile.residence_country and _residence_explicitly_excluded(
+        vacancy.description + "\n" + vacancy.location, profile.residence_country
+    ):
         return MatchResult("rejected", 0,
                            (f"The vacancy explicitly excludes applicants from {profile.residence_country}.",), (), ())
     scopes = _remote_scopes(vacancy.location)
@@ -156,14 +182,7 @@ def evaluate(profile: CandidateProfile, vacancy: Vacancy) -> MatchResult:
     if remote_only and (office_in_location or _OFFICE.search(description)):
         warnings.append("Office or hybrid terms also appear; confirm the role is fully remote.")
 
-    matched_skills_list: list[str] = []
-    seen_skills: set[str] = set()
-    for skill in profile.skills:
-        key = _skill_key(skill)
-        if key not in seen_skills and _skill_mentioned(vacancy.title + " " + vacancy.description, skill):
-            matched_skills_list.append(skill)
-            seen_skills.add(key)
-    matched_skills = tuple(matched_skills_list)
+    matched_skills = matched_profile_skills(profile, vacancy.title + " " + vacancy.description)
     if matched_skills:
         score += min(30, len(matched_skills) * 10)
         reasons.append("Profile skills appear in the vacancy: " + ", ".join(matched_skills) + ".")

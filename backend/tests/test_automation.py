@@ -22,7 +22,7 @@ def profile():
 
 def review():
     job = Vacancy("ashby", "example", "1", "Example", "Automation Engineer", "Remote - Worldwide",
-                  "Build n8n and REST APIs.\nSend your resume to jobs@example.com", "https://example.com/1", None)
+                  "Build n8n workflows and REST APIs to automate business processes, validate and deduplicate lead intake.\nSend your resume to jobs@example.com", "https://example.com/1", None)
     return {name: getattr(job, name) for name in job.__dataclass_fields__} | {
         "id": 1, "status": "draft", "is_active": True, "delivery_status": None,
         "last_seen_at": datetime.now(timezone.utc),
@@ -30,6 +30,14 @@ def review():
 
 
 class AutomationTests(unittest.TestCase):
+    def setUp(self):
+        self.alert_check = patch("app.applications.automation.check_alert_leads", return_value={"resolved": 0})
+        self.description_check = patch("app.applications.automation.screen_saved_vacancies", return_value={"matched": 0, "manual": 0, "rejected": 0})
+        self.alert_check.start()
+        self.description_check.start()
+        self.addCleanup(self.alert_check.stop)
+        self.addCleanup(self.description_check.stop)
+
     @patch("app.applications.automation.run_searches")
     @patch("app.applications.automation.collect_alerts")
     @patch("app.applications.automation.send_email")
@@ -131,6 +139,22 @@ class AutomationTests(unittest.TestCase):
         report = AutomationPipeline(repository, Mock())(repository, ())
         self.assertEqual(report["sent"], 0)
         search.assert_not_called()
+
+    @patch("app.applications.automation.run_searches")
+    def test_screening_is_before_enqueue_and_sending_even_when_disconnected(self, search):
+        from app.applications import automation
+        order = Mock()
+        order.attach_mock(automation.check_alert_leads, "alerts")
+        order.attach_mock(automation.screen_saved_vacancies, "descriptions")
+        repository = Mock()
+        order.attach_mock(repository.enqueue_notifications, "enqueue")
+        repository.automation_lock.return_value = nullcontext(True)
+        store = Mock()
+        store.load.return_value = AutomationSettings()
+        search.return_value = {"sources": [], "successful": 1, "failed": 0, "sent": 0}
+        AutomationPipeline(repository, store)(repository, ())
+        self.assertEqual([item[0] for item in order.mock_calls], ["alerts", "descriptions", "enqueue"])
+        repository.claim_notifications.assert_not_called()
 
     @patch("app.applications.automation.run_searches")
     @patch("app.applications.automation.collect_alerts", side_effect=RuntimeError("private server message"))

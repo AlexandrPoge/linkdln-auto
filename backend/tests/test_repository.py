@@ -9,6 +9,8 @@ from app.candidate.profile import CandidateProfile
 from app.applications.queue import QueueCandidate
 from app.infrastructure.persistence.postgres import Repository
 from app.vacancies.models import Vacancy
+from app.vacancies.screening import screen_saved_vacancies
+from test_screening import profile as screening_profile, job as screening_job
 
 
 def _vacancy(job_id: str, title: str = "Engineer") -> Vacancy:
@@ -41,7 +43,7 @@ class RepositoryTests(unittest.TestCase):
 
     def setUp(self) -> None:
         with psycopg.connect(self.repository.database_url) as connection:
-            connection.execute("TRUNCATE job_notifications, alert_leads, mailbox_cursors, source_refreshes, application_delivery_attempts, application_reviews, vacancies, candidate_profiles RESTART IDENTITY")
+            connection.execute("TRUNCATE vacancy_screenings, job_notifications, alert_leads, mailbox_cursors, source_refreshes, application_delivery_attempts, application_reviews, vacancies, candidate_profiles RESTART IDENTITY")
 
     def test_source_throttle_and_notification_claim_survive_repeated_calls(self):
         self.assertTrue(self.repository.claim_source_refresh("remotive", 21600))
@@ -52,12 +54,91 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.repository.save_alert_leads([link]), 0)
         self.repository.enqueue_notifications()
         self.repository.enqueue_notifications()
+        self.assertEqual(self.repository.claim_notifications(), [])  # Labels are not verified vacancies.
+        self.repository.save_profile(screening_profile())
+        self.repository.import_board("example", [screening_job()], source="ashby")
+        screen_saved_vacancies(self.repository, screening_profile())
+        self.repository.enqueue_notifications()
         items = self.repository.claim_notifications()
         self.assertEqual(len(items), 1)
         self.assertEqual(self.repository.claim_notifications(), [])
         self.repository.finish_notifications([items[0]["id"]], sent=False)
         self.assertEqual(self.repository.claim_notifications(), [])
         self.assertEqual(self.repository.automation_stats()["uncertain_total"], 1)
+
+    def test_old_unverified_outbox_is_held_without_deleting_history(self):
+        with psycopg.connect(self.repository.database_url) as connection:
+            connection.execute("""INSERT INTO job_notifications(source, external_id, title, url, kind)
+                VALUES ('linkedin', '12345678', 'Backend Engineer', 'https://www.linkedin.com/jobs/view/12345678/',
+                        'Ссылка из письма; условия не проверены')""")
+        self.repository.enqueue_notifications()
+        self.assertEqual(self.repository.claim_notifications(), [])
+        stats = self.repository.automation_stats()
+        self.assertEqual((stats["notification_pending"], stats["notification_held"]), (0, 1))
+
+    def test_notification_claim_rechecks_profile_and_vacancy_evidence(self):
+        candidate, job = screening_profile(), screening_job()
+        self.repository.save_profile(candidate)
+        self.repository.import_board("example", [job], source="ashby")
+        self.assertEqual(screen_saved_vacancies(self.repository, candidate)["matched"], 1)
+        self.repository.enqueue_notifications()
+        self.repository.import_board("example", [replace(job, description=job.description + " Must be based in Poland.")], source="ashby")
+        self.assertEqual(self.repository.claim_notifications(), [])
+        self.assertEqual(screen_saved_vacancies(self.repository, candidate)["rejected"], 1)
+        self.repository.import_board("example", [job], source="ashby")
+        screen_saved_vacancies(self.repository, candidate)
+        self.repository.save_profile(screening_profile(residence_country="UK"))
+        self.assertEqual(self.repository.claim_notifications(), [])
+
+    def test_rejected_manual_and_short_descriptions_do_not_enqueue_notifications(self):
+        candidate = screening_profile()
+        self.repository.save_profile(candidate)
+        jobs = [screening_job(external_id="1"), screening_job(external_id="2", title="Senior Automation Engineer"),
+                screening_job(external_id="3", location="Remote - Europe"),
+                screening_job(external_id="4", description="n8n REST API")]
+        self.repository.import_board("example", jobs, source="ashby")
+        self.assertEqual(screen_saved_vacancies(self.repository, candidate), {"matched": 1, "manual": 2, "rejected": 1})
+        self.repository.enqueue_notifications()
+        items = self.repository.claim_notifications()
+        self.assertEqual([item["external_id"] for item in items], ["1"])
+
+    def test_profile_changes_allow_reclassification_of_unverified_alerts(self):
+        self.repository.save_profile(screening_profile())
+        self.repository.save_alert_leads([{"source": "linkedin", "external_id": "12345678",
+                                         "title": "Senior Automation Engineer", "url": "https://www.linkedin.com/jobs/view/12345678/"}])
+        lead = self.repository.list_alert_leads()[0]
+        self.repository.finish_alert_screening(lead["id"], "rejected", "Senior title")
+        self.assertEqual(self.repository.list_alert_leads_to_check(), [])
+        self.repository.save_profile(screening_profile(roles=["Senior Automation Engineer"]))
+        self.assertEqual(len(self.repository.list_alert_leads_to_check()), 1)
+
+    def test_same_job_in_multiple_searches_enqueues_once_and_preserves_sent_history(self):
+        candidate, job = screening_profile(), screening_job()
+        self.repository.save_profile(candidate)
+        self.repository.import_board("example", [job], source="ashby", close_missing=False)
+        self.repository.import_board("other-query", [replace(job, board_token="other-query")], source="ashby", close_missing=False)
+        screen_saved_vacancies(self.repository, candidate)
+        self.repository.enqueue_notifications()
+        items = self.repository.claim_notifications()
+        self.assertEqual(len(items), 1)
+        self.repository.finish_notifications([items[0]["id"]], sent=True, reference="test-send")
+        self.repository.enqueue_notifications()
+        self.assertEqual(self.repository.claim_notifications(), [])
+
+    def test_autoapproval_requires_current_screening_and_profile(self):
+        from app.applications.queue import refresh_queue
+        candidate, job = screening_profile(), screening_job()
+        self.repository.save_profile(candidate)
+        self.repository.import_board("example", [job], source="ashby")
+        refresh_queue(self.repository)
+        row = self.repository.list_reviews()[0]
+        self.assertEqual(self.repository.auto_approve_review(row, "jobs@example.com"), 0)
+        screen_saved_vacancies(self.repository, candidate)
+        self.repository.save_profile(screening_profile(residence_country="UK"))
+        self.assertEqual(self.repository.auto_approve_review(row, "jobs@example.com"), 0)
+        self.repository.save_profile(candidate)
+        screen_saved_vacancies(self.repository, candidate)
+        self.assertEqual(self.repository.auto_approve_review(row, "jobs@example.com"), 1)
 
     def test_mailbox_epoch_resets_cursor(self):
         self.repository.save_mailbox_cursor("account", "one", 9)
