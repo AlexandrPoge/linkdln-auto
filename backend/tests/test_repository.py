@@ -140,6 +140,28 @@ class RepositoryTests(unittest.TestCase):
         screen_saved_vacancies(self.repository, candidate)
         self.assertEqual(self.repository.auto_approve_review(row, "jobs@example.com"), 1)
 
+    def test_scoped_dashboard_counts_and_stable_screening_batches(self):
+        candidate = screening_profile()
+        self.repository.save_profile(candidate)
+        self.repository.import_board("example", [screening_job(external_id="1"),
+            screening_job(external_id="2", search_track="belarus", location="Remote - Belarus")], source="ashby")
+        screen_saved_vacancies(self.repository, candidate)
+        self.assertEqual(self.repository.vacancy_screening_stats(track="international"), {"matched": 1})
+        self.assertEqual(self.repository.vacancy_screening_stats(track="belarus"), {"matched": 1})
+        first = self.repository.screening_batch(0, 1)
+        second = self.repository.screening_batch(first[0]["id"], 1)
+        self.assertNotEqual(first[0]["id"], second[0]["id"])
+        self.assertEqual(self.repository.screening_batch(second[0]["id"], 1), [])
+
+    def test_dashboard_deduplicates_query_identities_conservatively(self):
+        candidate = screening_profile()
+        self.repository.save_profile(candidate)
+        self.repository.import_board("example", [screening_job(external_id="same")], source="ashby")
+        self.repository.import_board("another", [screening_job(board_token="another", external_id="same",
+            description="Incomplete workflow description")], source="ashby")
+        screen_saved_vacancies(self.repository, candidate)
+        self.assertEqual(self.repository.vacancy_screening_stats(), {"manual": 1})
+
     def test_mailbox_epoch_resets_cursor(self):
         self.repository.save_mailbox_cursor("account", "one", 9)
         self.assertEqual(self.repository.mailbox_cursor("account", "one"), 9)

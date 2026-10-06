@@ -244,6 +244,14 @@ class Repository:
                       candidate.draft_text, candidate.vacancy_id)).rowcount
         return added
 
+    def screening_batch(self, after_id: int = 0, limit: int = 200) -> list[dict]:
+        if type(after_id) is not int or after_id < 0 or not 1 <= limit <= 200:
+            raise ValueError("invalid screening batch")
+        with self._connect() as connection:
+            return [dict(row) for row in connection.execute(
+                "SELECT * FROM vacancies WHERE is_active AND id > %s ORDER BY id LIMIT %s",
+                (after_id, limit)).fetchall()]
+
     def list_reviews(self, limit: int = 100, *, track: str | None = None) -> list[dict[str, Any]]:
         if not 1 <= limit <= 500:
             raise ValueError("limit must be between 1 and 500")
@@ -384,15 +392,25 @@ class Repository:
             return {row["screening_status"]: row["n"] for row in connection.execute(
                 "SELECT screening_status, count(*) AS n FROM alert_leads GROUP BY screening_status").fetchall()}
 
-    def vacancy_screening_stats(self) -> dict:
+    def vacancy_screening_stats(self, *, track: str | None = None) -> dict:
+        if track is not None and track not in SEARCH_TRACKS:
+            raise ValueError("invalid search track")
         with self._connect() as connection:
             return {row["status"]: row["n"] for row in connection.execute("""
-                SELECT s.status, count(*) AS n FROM vacancies AS v
-                JOIN vacancy_screenings AS s ON s.vacancy_id = v.id
-                JOIN candidate_profiles AS p ON p.id = 1 AND p.data = s.profile_data
-                WHERE v.is_active AND s.evidence <@ to_jsonb(v)
-                GROUP BY s.status
-            """).fetchall()}
+                WITH identities AS (
+                    SELECT v.source, v.external_id,
+                        CASE WHEN bool_or(s.status = 'rejected') THEN 'rejected'
+                             WHEN bool_or(s.status = 'manual') THEN 'manual'
+                             ELSE 'matched' END AS status
+                    FROM vacancies AS v
+                    JOIN vacancy_screenings AS s ON s.vacancy_id = v.id
+                    JOIN candidate_profiles AS p ON p.id = 1 AND p.data = s.profile_data
+                    WHERE v.is_active AND s.evidence <@ to_jsonb(v)
+                        AND (%s::text IS NULL OR v.search_track = %s)
+                    GROUP BY v.source, v.external_id
+                )
+                SELECT status, count(*) AS n FROM identities GROUP BY status
+            """, (track, track)).fetchall()}
 
     def list_alert_leads_to_check(self, limit: int = 500) -> list[dict]:
         if not 1 <= limit <= 500:
@@ -469,11 +487,13 @@ class Repository:
     def automation_stats(self) -> dict:
         with self._connect() as connection:
             sent = connection.execute("SELECT count(*) AS n FROM application_delivery_attempts WHERE status = 'sent'").fetchone()["n"]
+            attempts = connection.execute("SELECT count(*) AS n FROM application_delivery_attempts WHERE started_at > now() - interval '24 hours'").fetchone()["n"]
             pending = connection.execute(f"SELECT count(*) AS n FROM job_notifications AS n WHERE n.status = 'pending' AND {_ELIGIBLE_NOTIFICATION}").fetchone()["n"]
             held = connection.execute(f"SELECT count(*) AS n FROM job_notifications AS n WHERE n.status = 'pending' AND NOT ({_ELIGIBLE_NOTIFICATION})").fetchone()["n"]
             uncertain = connection.execute("SELECT count(*) AS n FROM application_delivery_attempts WHERE status IN ('uncertain','sending')").fetchone()["n"]
             uncertain += connection.execute("SELECT count(*) AS n FROM job_notifications WHERE status IN ('uncertain','sending')").fetchone()["n"]
-        return {"sent_total": sent, "notification_pending": pending, "notification_held": held, "uncertain_total": uncertain}
+        return {"sent_total": sent, "attempts_24h": attempts, "notification_pending": pending,
+                "notification_held": held, "uncertain_total": uncertain}
 
     def finish_delivery(self, attempt_id: int, *, sent: bool, reference: str = "", error: str = "") -> None:
         if attempt_id <= 0:

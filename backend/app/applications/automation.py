@@ -240,7 +240,7 @@ class AutomationPipeline:
             stages["digest"] = "disabled"
         return report
 
-    def snapshot(self) -> dict:
+    def snapshot(self, *, track: str | None = None) -> dict:
         settings = self.store.load()
         oauth = self.oauth.status() if self.oauth else {"connected": False, "client_configured": False, "email": ""}
         return {"connected": settings.connected or oauth["connected"], "oauth": oauth,
@@ -249,5 +249,5 @@ class AutomationPipeline:
                 "send_applications": settings.send_applications, "auto_approve": settings.auto_approve,
                 "daily_limit": settings.daily_limit, **self.repository.automation_stats(),
                 "alert_screening": self.repository.alert_screening_stats(),
-                "screening_counts": self.repository.vacancy_screening_stats(),
+                "screening_counts": self.repository.vacancy_screening_stats(track=track),
                 "leads": self.repository.list_alert_leads(20)}

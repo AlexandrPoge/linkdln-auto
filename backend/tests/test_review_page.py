@@ -218,7 +218,7 @@ class ReviewPageTests(unittest.TestCase):
         self.assertIn("Example &amp; Co", page)
         self.assertIn("Отсеяно", page)
         self.assertIn("Руководящая позиция вне текущего поиска.", page)
-        self.assertIn("новых вакансий: 1", page)
+        self.assertIn("новых записей: 1", page)
         self.assertIn('action="/search-now"', page)
 
     def test_search_now_requires_token_and_uses_runner(self) -> None:
@@ -257,12 +257,64 @@ class ReviewPageTests(unittest.TestCase):
                 "source_updated_at": None}
         jobs = [base | {"external_id": str(index), "title": f"Sales Manager {index}",
                         "url": f"https://example.com/{index}"} for index in range(10)]
-        jobs.append(base | {"external_id": "11", "title": "AI Workflow Specialist",
+        jobs.append(base | {"external_id": "11", "title": "Automation Engineer",
                             "url": "https://example.com/11"})
         page = render_page([], "secret", profile=profile, discovered=jobs)
-        self.assertLess(page.index("AI Workflow Specialist"), page.index("Остальные найденные вакансии"))
+        self.assertLess(page.index("Automation Engineer</h3>"), page.index("Отсеянные вакансии"))
         self.assertIn("Отсеяно", page)
-        self.assertIn("Остальные найденные вакансии (10)", page)
+        self.assertIn("Отсеянные вакансии (10)", page)
+
+    def test_dashboard_navigation_uses_real_sections_and_no_external_assets(self):
+        page = render_page([], "csrf")
+        for section in ("overview", "opportunities", "queue", "sources", "settings"):
+            self.assertIn(f'href="#{section}"', page)
+            self.assertIn(f'id="{section}"', page)
+        self.assertIn("flow / jobs", page)
+        self.assertIn("@media(max-width:760px)", page)
+        self.assertIn("prefers-reduced-motion", page)
+        self.assertNotIn('<script', page)
+        self.assertNotIn('fonts.googleapis', page)
+
+    def test_source_and_stage_results_are_human_readable_not_python_dicts(self):
+        status = {"running": False, "finished_at": None, "error": None, "interval_seconds": 21600,
+                  "report": {"successful": 1, "failed": 1, "sources": [
+                      {"source": "ashby:zapier", "status": "ok", "total": 9, "new": 1},
+                      {"source": "hh:n8n", "status": "failed", "error": "api.hh.ru: HTTP 403"}],
+                      "automation": {"mailbox": {"processed": 94, "new_links": 188},
+                                     "applications": {"sent": 0, "uncertain": 0}, "digest": "disabled"}}}
+        page = render_page([], "csrf", search_status=status)
+        self.assertIn("Zapier · Ashby", page)
+        self.assertIn("Источник вернул 403", page)
+        self.assertIn("писем обработано: 94", page)
+        self.assertIn("Этап выключен в настройках", page)
+        self.assertNotIn("&#x27;processed&#x27;", page)
+
+    def test_running_search_disables_only_extra_run_button(self):
+        status = {"running": True, "finished_at": None, "error": None, "interval_seconds": 21600, "report": None}
+        page = render_page([], "csrf", search_status=status)
+        self.assertIn('disabled>Искать сейчас', page)
+        self.assertIn("Идёт поиск", page)
+        self.assertIn('name="csrf" value="csrf"', page)
+
+    def test_overview_never_claims_disabled_mail_stages_are_running(self):
+        from app.api.review import _overview
+        state = {"connected": True, "send_applications": False, "notifications": False,
+                 "auto_approve": False, "daily_limit": 5, "attempts_24h": 2,
+                 "screening_counts": {"matched": 1}}
+        panel = _overview(state, {}, "international")
+        self.assertIn("отклики: выключены", panel)
+        self.assertIn("Подборки: выключены", panel)
+        self.assertIn("Отправка откликов выключена", panel)
+        self.assertIn("2 <em>/ 5", panel)
+
+    def test_discovered_jobs_are_deduplicated_with_reasons_preserved(self):
+        from app.api.review import _discovered_vacancies
+        from test_screening import profile, job
+        vacancy = job()
+        row = {name: getattr(vacancy, name) for name in vacancy.__dataclass_fields__}
+        output, count = _discovered_vacancies([row, row | {"board_token": "another-query"}], profile())
+        self.assertEqual(count, 1)
+        self.assertEqual(output.count("Automation Engineer</h3>"), 1)
 
     def test_approved_item_is_not_editable(self) -> None:
         row = _review() | {"status": "approved"}
@@ -270,6 +322,18 @@ class ReviewPageTests(unittest.TestCase):
         self.assertNotIn('action="/edit/7"', page)
         self.assertIn('action="/recipient/7"', page)
         self.assertIn("не отправлено", page)
+
+    def test_identical_query_drafts_are_collapsed_without_removing_controls(self):
+        first = _review() | {"source": "himalayas", "external_id": "one-job"}
+        second = first | {"id": 8}
+        page = render_page([first, second], "secret")
+        self.assertIn("Повторные черновики (1)", page)
+        self.assertIn("Утвердить выбранные (1 доступны)", page)
+        self.assertIn('action="/edit/7"', page)
+        self.assertIn('action="/edit/8"', page)
+        page = render_page([first, second | {"draft_text": "My edited text"}], "secret")
+        self.assertNotIn("Повторные черновики", page)
+        self.assertIn("My edited text", page)
 
     def test_delivery_status_is_not_mistaken_for_approval(self) -> None:
         page = render_page([_review() | {"status": "approved", "delivery_status": "uncertain"}], "secret")

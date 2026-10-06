@@ -1,5 +1,6 @@
 import unittest
 from dataclasses import replace
+from unittest.mock import Mock
 
 from app.candidate.profile import CandidateProfile
 from app.matching.screening import screen, screen_title
@@ -96,6 +97,17 @@ class ScreeningTests(unittest.TestCase):
     def test_salary_and_missing_residence_are_not_assumed(self):
         self.assertEqual(screen(profile(residence_country=None), job()).status, "manual")
         self.assertEqual(screen(profile(salary_min=50000, salary_currency="EUR"), job()).status, "manual")
+
+    def test_screening_paginates_past_five_hundred_without_skipping_older_jobs(self):
+        from app.vacancies.screening import screen_saved_vacancies
+        template = job()
+        rows = [{name: getattr(template, name) for name in template.__dataclass_fields__} | {"id": i}
+                for i in range(1, 502)]
+        repository = Mock()
+        repository.screening_batch.side_effect = lambda after_id, limit: rows[after_id:after_id + limit]
+        repository.save_screening.return_value = True
+        self.assertEqual(screen_saved_vacancies(repository, profile())["matched"], 501)
+        self.assertEqual([call.args for call in repository.screening_batch.call_args_list], [(0, 200), (200, 200), (400, 200)])
 
 
 if __name__ == "__main__":

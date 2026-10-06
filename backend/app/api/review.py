@@ -1,6 +1,7 @@
 import html
 import re
 import secrets
+from pathlib import Path
 from dataclasses import replace
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +22,7 @@ from app.vacancies.models import SEARCH_TRACKS
 from app.vacancies.models import Vacancy
 
 _MAX_BODY_BYTES = 64_000
+_DASHBOARD_CSS = Path(__file__).with_name("dashboard.css").read_text(encoding="utf-8")
 _STATUS_LABELS = {
     "draft": "Черновик",
     "approved": "Утверждено · не отправлено",
@@ -93,7 +95,7 @@ def _search_status(search_status: dict[str, Any] | None) -> str:
     elif report := search_status["report"]:
         new_count = sum(int(item.get("new", 0)) for item in report["sources"] if item["status"] == "ok")
         summary = (f"Последний запуск · источников проверено: {report['successful']} · "
-                   f"ошибок: {report['failed']} · новых вакансий: {new_count} · отправлено откликов: {report.get('sent', 0)}.")
+                   f"ошибок: {report['failed']} · новых записей: {new_count} · отправлено откликов: {report.get('sent', 0)}.")
         style = "ok" if not report["failed"] else "error"
     else:
         summary = "Первый поиск запустится при открытии сервера."
@@ -103,13 +105,84 @@ def _search_status(search_status: dict[str, Any] | None) -> str:
     hours = search_status["interval_seconds"] // 3600
     interval = f"каждые {hours} ч" if hours else f"каждые {search_status['interval_seconds'] // 60} мин"
     report = search_status.get("report") or {}
-    source_details = "".join(f'<li>{_escape(item["source"])} · {_escape(item["status"])} · '
-                             f'{_escape(item.get("error") or item.get("note") or str(item.get("total", 0)) + " вакансий")}</li>'
-                             for item in report.get("sources", []))
-    stage_details = "".join(f'<li>{_escape(key)}: {_escape(value)}</li>' for key, value in report.get("automation", {}).items())
+    source_details = ""
+    for item in report.get("sources", []):
+        kind, _, target = item["source"].partition(":")
+        label = {"ashby": "Ashby", "greenhouse": "Greenhouse", "himalayas": "Himalayas",
+                 "remotive": "Remotive", "hh": "hh.ru"}.get(kind, kind)
+        if kind in {"ashby", "greenhouse"}:
+            label = {"n8n": "n8n", "zapier": "Zapier", "workato": "Workato"}.get(target, target) + " · " + label
+        elif kind == "himalayas":
+            label += " · " + target.removeprefix("BY:").removesuffix(":worldwide")
+        state = item["status"]
+        badge = {"ok": "Доступен", "failed": "Проблема доступа", "cooldown": "Пауза по лимиту"}.get(state, "Ожидает")
+        note = (f"Получено описаний: {item.get('total', 0)} · новых: {item.get('new', 0)}" if state == "ok" else
+                "Следующее обновление — после паузы в 6 часов" if state == "cooldown" else
+                "Источник вернул 403. Остальные продолжают работу." if "403" in item.get("error", "") else
+                "Не удалось загрузить данные. Остальные источники работают.")
+        source_details += (f'<article class="source-card"><div class="source-top"><span class="source-name">{_escape(label)}</span>'
+                           f'<span class="source-status {_escape(state)}">{badge}</span></div><p>{_escape(note)}</p></article>')
+    stages = report.get("automation", {})
+    stage_details = ""
+    for key, label in (("mailbox", "Почтовые уведомления"), ("alert_screening", "Ссылки из писем"),
+                       ("screening", "Проверка описаний"), ("applications", "Отклики работодателям"),
+                       ("digest", "Подборка на твою почту")):
+        value = stages.get(key)
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            fields = {"processed": "писем обработано", "new_links": "новых ссылок", "matched": "подходит",
+                      "manual": "на проверку", "rejected": "отсеяно", "sent": "отправлено",
+                      "items": "вакансий в подборке", "uncertain": "результат неясен"}
+            note = " · ".join(f"{label}: {value[name]}" for name, label in fields.items() if name in value)
+            if "detail_error" in value:
+                note += " · Описания hh недоступны; ссылки сохранены для проверки."
+        else:
+            note = {"disabled": "Этап выключен в настройках", "not connected": "Нужно подключить Gmail"}.get(value,
+                    "Не завершено. Проверь подключение и детали ниже.")
+        stage_details += f'<div class="stage-row"><strong>{label}</strong><span>{_escape(note)}</span></div>'
     return (f'<p class="run-status {style}" role="status">{summary}</p>'
             f'<p class="muted">Последняя проверка: {_escape(when)} · Повтор: {interval}, пока приложение запущено.</p>'
-            f'<details><summary>Источники и результаты этапов</summary><ul>{source_details}{stage_details}</ul></details>')
+            f'<div class="source-grid">{source_details}</div>'
+            f'<details><summary>Источники и результаты этапов</summary><div class="stage-list">{stage_details}</div></details>')
+
+
+def _overview(state: dict | None, search_status: dict | None, track: str) -> str:
+    state = state or {}
+    counts = state.get("screening_counts", {})
+    connected = bool(state.get("connected"))
+    sends = connected and bool(state.get("send_applications"))
+    notices = connected and bool(state.get("notifications"))
+    configured = search_status is not None
+    limit = state.get("daily_limit", 5)
+    attempts = state.get("attempts_24h", 0)
+    matched, manual = counts.get("matched", 0), counts.get("manual", 0)
+    if state.get("uncertain_total", 0):
+        heading, message = "Проверь отправленные письма", "Есть неясный результат отправки. Повтор заблокирован, чтобы не отправить письмо дважды."
+    elif not connected:
+        heading, message = "Подключи Gmail для отправки", "Вакансии можно искать без почты. Подключение находится в настройках ниже."
+    elif not matched and manual:
+        heading, message = "Есть вакансии на проверку", "Проверь ограничения по стране и требованиям в очереди. Без подтверждения автоматический отклик не уйдёт."
+    elif not matched:
+        heading, message = "Ждём подходящую вакансию", "Новых подтверждённых предложений нет. Поиск продолжится по расписанию; неподходящие вакансии не отправляются."
+    elif not sends:
+        heading, message = "Отправка откликов выключена", "Подходящие вакансии найдены. Проверь резюме и настройки отправки."
+    else:
+        heading, message = "Подходящие вакансии найдены", "Подборка поступит на почту, если включена. Автоотклик возможен только на опубликованный адрес и в пределах лимита."
+    scope = "В Беларуси" if track == "belarus" else "За рубежом · удалённо"
+    return f'''<div class="metrics" aria-label="Сводка выбранного направления">
+<div class="metric featured"><span class="metric-label">Подходит по тексту</span><strong>{matched}</strong><span>{scope}</span></div>
+<div class="metric"><span class="metric-label">Нужна проверка</span><strong>{manual}</strong><span>Условия ещё не подтверждены</span></div>
+<div class="metric"><span class="metric-label">Откликов отправлено</span><strong>{state.get('sent_total', 0)}</strong><span>Всего · оба направления</span></div>
+<div class="metric"><span class="metric-label">Попытки за 24 часа</span><strong>{attempts} <em>/ {limit}</em></strong><span>Общий лимит, включая неясные</span></div></div>
+<div class="overview-grid"><section class="search-panel"><div class="section-heading"><h2>Как работает автопилот</h2><span class="muted">Без AI</span></div>
+<div class="pipeline"><div class="pipeline-step"><span class="step-number">01</span><div><strong>Собирает вакансии</strong><p>Доски работодателей, агрегаторы и письма</p></div><span class="step-state {'off' if not configured else ''}">{'По расписанию' if configured else 'Не настроено'}</span></div>
+<div class="pipeline-step"><span class="step-number">02</span><div><strong>Проверяет описание</strong><p>Роль, навыки, удалёнка и ограничения по стране</p></div><span class="step-state">Строгий фильтр</span></div>
+<div class="pipeline-step"><span class="step-number">03</span><div><strong>Отправляет по правилам</strong><p>Подборки: {'включены' if notices else 'выключены'} · отклики: {'включены' if sends else 'выключены'}</p></div><span class="step-state {'off' if not sends else ''}">{'До ' + str(limit) + ' в сутки' if sends else 'Отправка выкл.'}</span></div></div>
+<p class="muted">Для работы нужны запущенное приложение, база данных и компьютер без режима сна. LinkedIn-сообщения и формы откликов пока не отправляются.</p></section>
+<section class="search-panel"><div class="section-heading"><h2>Что требует внимания</h2></div><div class="next-action"><strong>{heading}</strong><p>{message}</p></div>
+<p class="muted">Gmail: {'подключён' if connected else 'не подключён'} · автоутверждение: {'включено' if state.get('auto_approve') else 'выключено'}.</p>
+<div class="button-row"><a class="button" href="#queue">Открыть очередь ↗</a><a href="#settings" class="muted">Настройки</a></div></section></div>'''
 
 
 def _automation_panel(state: dict | None, csrf: str, track: str, profile: CandidateProfile | None) -> str:
@@ -176,11 +249,16 @@ def _automation_panel(state: dict | None, csrf: str, track: str, profile: Candid
 def _discovered_vacancies(rows: list[dict[str, Any]], profile: CandidateProfile | None) -> tuple[str, int]:
     if profile is None:
         return '<p class="empty">Сначала сохраните профиль кандидата.</p>', 0
-    ranked: list[tuple[int, bool, str]] = []
+    ranked: list[tuple[int, str, str]] = []
     matching = 0
+    seen = set()
     for row in rows:
         job = Vacancy(**{field: row[field] for field in Vacancy.__dataclass_fields__ if field in row})
         result = screen(profile, job)
+        identity = (job.source, job.external_id)
+        if identity in seen:
+            continue
+        seen.add(identity)
         possible = result.status == "matched"
         matching += possible
         label = {"matched": "Подходит по тексту", "manual": "Нужна проверка", "rejected": "Отсеяно"}[result.status]
@@ -192,30 +270,35 @@ def _discovered_vacancies(rows: list[dict[str, Any]], profile: CandidateProfile 
         if re.search(r"\b(sales|account|marketing|manager|director|qa|quality assurance)\b", title):
             relevance = 0
         relevance += 10 if possible else 0
-        ranked.append((relevance, possible, f'''
+        ranked.append((relevance, result.status, f'''
             <article class="discovery-card">
-              <div class="discovery-head"><span class="chip {'possible' if possible else 'filtered'}">{label}</span>
+              <div class="discovery-head"><span class="chip { {'matched': 'possible', 'manual': 'manual', 'rejected': 'filtered'}[result.status] }">{label}</span>
               <span class="muted">{_escape(job.source)}</span></div>
               <h3>{_escape(job.title)}</h3>
               <p class="meta compact" title="{_escape(job.location)}">{_escape(job.company)} · {_escape(job.location)}</p>
               <p class="reason">{_escape(reason)}</p>
               <p>{_vacancy_link(job.url)}</p>
             </article>'''))
-    ranked.sort(key=lambda item: (-item[0], not item[1]))
-    featured = [item for item in ranked if item[0] > 0][:8]
-    cards = "".join(item[2] for item in featured)
-    if not cards:
-        cards = ('<p class="empty">Среди последних вакансий нет близких к автоматизации. '
-                 'Остальные предложения можно открыть ниже.</p>' if ranked else
-                 '<p class="empty">Источники ещё не вернули вакансий для этого направления.</p>')
-    featured_ids = {id(item) for item in featured}
-    remaining = [item[2] for item in ranked if id(item) not in featured_ids]
-    rest_html = ""
-    if remaining:
-        note = '<p class="muted">Показаны первые 50 из остальных.</p>' if len(remaining) > 50 else ""
-        rest_html = (f'<details class="all-results"><summary>Остальные найденные вакансии ({len(remaining)})</summary>'
-                     f'<div class="discovery-list">{"".join(remaining[:50])}</div>{note}</details>')
-    return f'<div class="discovery-list">{cards}</div>{rest_html}', matching
+    ranked.sort(key=lambda item: -item[0])
+    matched = [item[2] for item in ranked if item[1] == "matched"]
+    manual = [item[2] for item in ranked if item[1] == "manual"]
+    rejected = [item[2] for item in ranked if item[1] == "rejected"]
+    cards = ('<div class="discovery-list">' + "".join(matched[:12]) + '</div>' if matched else
+             '<div class="empty"><strong>Подтверждённых предложений пока нет</strong>'
+             'Это не ошибка отправки. Сейчас нет вакансий, прошедших все проверки. '
+             'Автопилот продолжит поиск по расписанию.</div>')
+    if len(matched) > 12:
+        cards += '<p class="muted">Показаны первые 12 подходящих вакансий из последних загруженных.</p>'
+    if manual:
+        cards += (f'<h3 class="group-title">На проверку перед откликом <span class="count-badge">{len(manual)}</span></h3>'
+                  f'<div class="discovery-list">{"".join(manual[:10])}</div>')
+        if len(manual) > 10:
+            cards += '<p class="muted">Показаны первые 10 вакансий на проверку.</p>'
+    if rejected:
+        cards += (f'<details class="all-results"><summary>Отсеянные вакансии ({len(rejected)}) · показать причины</summary>'
+                  f'<div class="discovery-list">{"".join(rejected[:50])}</div>'
+                  '<p class="muted">Показаны до 50 отсеянных вакансий. Они не отправляются автоматически.</p></details>')
+    return cards, matching
 
 
 def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
@@ -227,6 +310,8 @@ def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
     track_input = f'<input type="hidden" name="track" value="{track}">'
     cards: list[str] = []
     archived_cards: list[str] = []
+    duplicate_cards: list[str] = []
+    seen_drafts: set[tuple] = set()
     for row in rows:
         review_id = int(row["id"])
         status = row.get("delivery_status") or row["status"]
@@ -252,13 +337,14 @@ def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
         if status == "draft" and row["is_active"]:
             controls = f'''
                 <label class="pick"><input type="checkbox" name="id" value="{review_id}" form="approve-form"> Выбрать для утверждения</label>
+                <details><summary>Текст отклика · посмотреть и изменить</summary>
                 <form method="post" action="/edit/{review_id}">
                     <input type="hidden" name="csrf" value="{_escape(csrf_token)}">
                     {track_input}
                     <label for="draft-{review_id}">Текст отклика</label>
                     <textarea id="draft-{review_id}" name="draft" maxlength="10000" required>{_escape(row['draft_text'])}</textarea>
                     <button type="submit">Сохранить текст</button>
-                </form>
+                </form></details>
                 <form method="post" action="/reject/{review_id}" class="reject">
                     <input type="hidden" name="csrf" value="{_escape(csrf_token)}">
                     {track_input}
@@ -287,6 +373,11 @@ def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
         if row.get("source") == "remotive":
             source_note = '<p class="warning">Источник: <a href="https://remotive.com/" target="_blank" rel="noopener noreferrer">Remotive</a>. Условия проверяй у работодателя.</p>'
         target_cards = archived_cards if row["status"] == "rejected" else cards
+        if status == "draft" and row.get("source") and row.get("external_id"):
+            key = (row["source"], row["external_id"], row["draft_text"], row["is_active"])
+            if key in seen_drafts:
+                target_cards = duplicate_cards
+            seen_drafts.add(key)
         target_cards.append(f'''
             <article class="card">
                 <div class="top"><span class="status {status}">{_escape(_STATUS_LABELS[status])}</span><span class="score">Оценка {int(row['score'])}/100</span></div>
@@ -302,80 +393,57 @@ def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
                 {controls}
             </article>''')
     cards_html = "".join(cards) if cards else '<p class="empty">Подходящих черновиков пока нет. Ниже видны найденные вакансии и причины отсева.</p>'
+    if duplicate_cards:
+        cards_html += (f'<details class="all-results"><summary>Повторные черновики ({len(duplicate_cards)}) · из других поисковых запросов</summary>'
+                       '<p class="muted">Одинаковая вакансия встретилась в нескольких запросах. Все тексты сохранены; достаточно утвердить один отклик.</p>'
+                       + "".join(duplicate_cards) + '</details>')
     archive_html = (f'<details class="all-results"><summary>Отклонённые черновики ({len(archived_cards)})</summary>'
                     f'{"".join(archived_cards)}</details>') if archived_cards else ""
     notice_html = f'<p class="notice" role="status">{_escape(notice)}</p>' if notice else ""
-    draft_ids = sum(row["status"] == "draft" and row["is_active"] for row in rows)
+    draft_ids = len({(row.get("source") or "review", row.get("external_id") or row["id"])
+                     for row in rows if row["status"] == "draft" and row["is_active"]})
     discovered = discovered or []
     discovery_html, possible_count = _discovered_vacancies(discovered, profile)
     search_button = (f'<form method="post" action="/search-now"><input type="hidden" name="csrf" value="{_escape(csrf_token)}">'
-                     f'{track_input}<button type="submit">Искать сейчас</button></form>') if search_status is not None else ""
+                     f'{track_input}<button type="submit" {"disabled" if search_status["running"] else ""}>Искать сейчас</button></form>') if search_status is not None else ""
+    candidate_name = profile.full_name if profile else "Мой профиль"
+    ready = bool(automation_state and automation_state.get("connected"))
+    scope = "Беларусь" if track == "belarus" else "Международный поиск"
     return f'''<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Поиск работы · Automation Engineer</title><style>
-:root {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #17253d; background: #eef3f9; }}
-body {{ margin: 0; }} main {{ max-width: 1120px; margin: auto; padding: 32px 18px 70px; }}
-h1 {{ margin: 0 0 8px; font-size: 2.2rem; }} h2 {{ margin: 12px 0 4px; }} h3 {{ font-size: .92rem; margin: 0 0 8px; }}
-.subtitle,.meta {{ color: #5d6a7d; }} .toolbar {{ display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin: 24px 0; }}
-button {{ background:#1157ad; color:white; border:0; border-radius:8px; padding:10px 16px; font-weight:600; cursor:pointer; }}
-button:hover {{ background:#0d4489; }} .secondary button {{ background:#e7eef9; color:#144783; }}
-.card {{ background:white; border:1px solid #dce5f1; border-radius:14px; padding:22px; margin:16px 0; box-shadow:0 3px 16px #1d41620d; }}
-.top {{ display:flex; gap:12px; align-items:center; justify-content:space-between; }} .status {{ font-size:.8rem; padding:5px 9px; border-radius:30px; background:#e8f1ff; }}
-.status.approved {{ background:#e4f6e8; }} .status.rejected {{ background:#f1e9e9; }} .score {{ color:#2767b5; font-weight:700; }}
-details {{ border-top:1px solid #e5ebf2; padding:12px 0; }} summary {{ cursor:pointer; font-weight:600; }}
-.detail-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:20px; }} ul {{ padding-left:20px; margin-bottom:0; }} li {{ margin:6px 0; }}
-.description {{ white-space:pre-wrap; line-height:1.5; }} textarea {{ box-sizing:border-box; width:100%; min-height:150px; padding:12px; font:inherit; border:1px solid #b9c8dc; border-radius:8px; margin:8px 0; }}
-input[type=email] {{ box-sizing:border-box; width:100%; padding:10px; font:inherit; border:1px solid #b9c8dc; border-radius:8px; margin:8px 0; }}
-input[type=password],input[type=text],input[type=number] {{ box-sizing:border-box; width:100%; padding:10px; font:inherit; border:1px solid #b9c8dc; border-radius:8px; margin:8px 0; }}
-.pick {{ display:block; margin:14px 0; font-weight:600; }} .reject {{ display:inline-block; margin-left:8px; }} .reject button {{ background:#f1e9e9; color:#7f2929; }}
-.saved-draft pre {{ white-space:pre-wrap; font:inherit; }} .warning {{ color:#9a4a05; }} .notice {{ background:#e2f4e7; padding:12px; border-radius:8px; }}
-.empty {{ padding:28px; background:white; border-radius:12px; }} .safety {{ background:#fff4dc; padding:12px; border-radius:8px; }}
-.tabs {{ display:flex; gap:8px; margin:20px 0; flex-wrap:wrap; }} .tabs a {{ padding:10px 15px; border-radius:8px; color:#144783; background:#e7eef9; text-decoration:none; font-weight:600; }}
-.tabs a[aria-current="page"] {{ color:white; background:#1157ad; }}
-.hero {{ background:linear-gradient(125deg,#102f59,#175e9f); color:white; border-radius:20px; padding:30px; box-shadow:0 14px 30px #10376426; }}
-.hero .subtitle {{ color:#d9eaff; }} .hero h1 {{ letter-spacing:-.03em; }}
-.metrics {{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:18px 0; }}
-.metric {{ background:white; border:1px solid #dce5f1; border-radius:14px; padding:18px 20px; }}
-.metric strong {{ display:block; font-size:1.9rem; color:#164d89; }} .metric span {{ color:#5d6a7d; font-size:.9rem; }}
-.search-panel {{ background:white; border:1px solid #dce5f1; border-radius:14px; padding:20px; margin:18px 0; }}
-.search-panel h2 {{ margin-top:0; }} .run-status {{ margin-bottom:4px; font-weight:600; }}
-.run-status.error {{ color:#9a4a05; }} .run-status.ok {{ color:#126447; }} .run-status.running {{ color:#1557a0; }}
-.muted {{ color:#68778c; font-size:.9rem; }} .section-title {{ margin:32px 0 10px; }}
-.discovery-list {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:14px; }}
-.discovery-card {{ background:white; border:1px solid #dce5f1; border-radius:12px; padding:17px; }}
-.discovery-card h3 {{ font-size:1rem; margin:10px 0 4px; }} .discovery-card p {{ margin:7px 0; }}
-.discovery-head {{ display:flex; align-items:center; justify-content:space-between; }}
-.chip {{ display:inline-block; border-radius:99px; padding:4px 9px; font-size:.77rem; font-weight:700; }}
-.chip.possible {{ background:#ddf3e5; color:#176845; }} .chip.filtered {{ background:#eef1f5; color:#647084; }}
-.reason {{ color:#34465b; font-size:.88rem; }}
-.compact {{ display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }}
-.all-results {{ background:#fff; border:1px solid #dce5f1; border-radius:12px; padding:14px 18px; margin:18px 0; }}
-.all-results summary {{ color:#164d89; }}
-@media(max-width:680px) {{ .detail-grid,.discovery-list,.metrics {{ grid-template-columns:1fr; }} .hero {{ padding:22px; }} }}
-</style></head><body><main>
-<div class="hero"><h1>Поиск работы</h1><p class="subtitle">Automation Engineer · удалённо · Беларусь и международный рынок</p></div>
+<title>Поиск работы · Automation Engineer</title><style>{_DASHBOARD_CSS}</style></head><body>
+<div class="app-layout"><aside class="sidebar"><a href="#overview" class="brand"><span class="brand-mark">↗</span> flow / jobs</a>
+<p class="sidebar-caption">Рабочая панель</p><nav class="side-nav" aria-label="Разделы панели">
+<a class="active" href="#overview"><span class="nav-symbol">◈</span>Обзор</a>
+<a href="#opportunities"><span class="nav-symbol">▤</span>Вакансии</a>
+<a href="#queue"><span class="nav-symbol">↗</span>Очередь откликов</a>
+<a href="#sources"><span class="nav-symbol">◎</span>Источники</a>
+<a href="#settings"><span class="nav-symbol">⚙</span>Настройки</a></nav>
+<div class="sidebar-footer"><strong>Automation Engineer</strong>Удалённо из Беларуси<br>Поиск и отклики по правилам<br>Без встроенного AI</div></aside>
+<main id="overview"><div class="topbar"><span>МОЯ РАБОТА / ОБЗОР</span><span class="account">{_escape(candidate_name)}</span></div>
+<div class="hero"><div><p class="eyebrow">Твой поиск, под контролем</p><h1>Поиск работы</h1><p class="subtitle">Automation Engineer · удалённо · Беларусь и международный рынок</p></div>
+<div class="hero-note"><span class="pill"><span class="dot"></span>{'Gmail подключён' if ready else 'Поиск без почты'}</span><p>Письма только по правилам</p></div></div>
 <nav class="tabs" aria-label="Направление поиска">
 <a href="/?track=belarus" {'aria-current="page"' if track == 'belarus' else ''}>В Беларуси</a>
 <a href="/?track=international" {'aria-current="page"' if track == 'international' else ''}>За рубежом · удалённо</a>
 </nav>
-<p class="subtitle">{'Вакансии, которые источник относит к удалённой работе из Беларуси. Условия подтверждайте у работодателя.' if track == 'belarus' else 'Международный поиск. Возможность работать из Беларуси проверяйте у работодателя; страна компании не подтверждена автоматически.'}</p>
+<p class="scope-note">{'Вакансии, которые источник относит к удалённой работе из Беларуси. Условия подтверждайте у работодателя.' if track == 'belarus' else 'Международный поиск. Возможность работать из Беларуси проверяйте у работодателя; страна компании не подтверждена автоматически.'}</p>
 {notice_html}
-<div class="metrics"><div class="metric"><strong>{len(discovered)}</strong><span>Проверено последних вакансий (до 200)</span></div>
-<div class="metric"><strong>{possible_count}</strong><span>Подходят по описанию</span></div>
-<div class="metric"><strong>{draft_ids}</strong><span>Черновиков на проверку</span></div></div>
-<section class="search-panel"><h2>Автоматический поиск</h2>{_search_status(search_status)}{search_button}
-<p class="muted">Greenhouse · Ashby · Himalayas · Remotive · hh. Ошибка одного источника не останавливает остальные.</p></section>
-{_automation_panel(automation_state, csrf_token, track, profile)}
-<h2 class="section-title">Очередь откликов</h2>
+{_overview(automation_state, search_status, track)}
+<section id="opportunities"><div class="section-heading"><h2 class="section-title">Что нашлось в источниках</h2><span class="muted">{_escape(scope)}</span></div>
+<p class="muted">Из последних {len(discovered)} записей (до 200); повторные вакансии объединены. «Подходит по тексту» не гарантирует право на работу; «Нужна проверка» не попадает в автоматическую подборку.</p>
+{discovery_html}</section>
+<section id="queue"><h2 class="section-title">Очередь откликов</h2>
 <p class="safety">Утверждённый отклик с адресом работодателя будет отправлен следующим циклом, если Gmail подключён и отправка включена.</p>
 <div class="toolbar">
 <form method="post" action="/refresh" class="secondary"><input type="hidden" name="csrf" value="{_escape(csrf_token)}">{track_input}<button type="submit">Обновить очередь</button></form>
 <form method="post" action="/approve" id="approve-form"><input type="hidden" name="csrf" value="{_escape(csrf_token)}">{track_input}<label class="pick"><input type="checkbox" name="checked" value="yes" required> Я проверил условия вакансий</label><button type="submit">Утвердить выбранные ({draft_ids} доступны)</button></form>
-</div>{cards_html}{archive_html}
-<h2 class="section-title">Что нашлось в источниках</h2>
-<p class="muted">Сначала близкие по теме, остальные — внутри списка. Это сохранённые вакансии; не все источники обновлялись последним запуском. «Подходит по тексту» — результат фильтра, не гарантия права на работу; «Нужна проверка» не попадает в автоматическую подборку.</p>
-{discovery_html}
-</main></body></html>'''
+</div>{cards_html}{archive_html}</section>
+<section class="search-panel" id="sources"><div class="section-heading"><h2>Автоматический поиск</h2>{search_button}</div>{_search_status(search_status)}
+<p class="muted">Greenhouse · Ashby · Himalayas · Remotive · hh. Ошибка одного источника не останавливает остальные. Новые записи могут включать одну вакансию из разных запросов. «Получено описаний» не означает, что все вакансии подходят.</p></section>
+<details class="settings-panel" id="settings"><summary>Настройки подключения и отправки</summary>{_automation_panel(automation_state, csrf_token, track, profile)}</details>
+<p class="activity-note">Ссылки из писем — отдельные непроверенные предложения. Отклик считается отправленным только после подтверждения Gmail. Результаты неясной отправки не повторяются автоматически.</p>
+</main></div></body></html>'''
 
 
 def _ids(values: list[str]) -> list[int]:
@@ -458,7 +526,7 @@ def make_handler(repository: Repository, csrf_token: str, search_runner: SearchR
                 self._respond(200, render_page(repository.list_reviews(track=track), csrf_token, notice, track,
                                                profile, repository.list_vacancies(200, track=track),
                                                search_runner.snapshot() if search_runner else None,
-                                               automation.snapshot() if automation else None))
+                                               automation.snapshot(track=track) if automation else None))
             except Exception:
                 self._respond(500, "Could not load the review queue")
 

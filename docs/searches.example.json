@@ -1,8 +1,13 @@
 {
   "sources": [
     {"source": "ashby", "board_token": "n8n", "company": "n8n"},
+    {"source": "ashby", "board_token": "zapier", "company": "Zapier"},
+    {"source": "greenhouse", "board_token": "workato"},
     {"source": "himalayas", "country": "BY", "query": "AI Automation", "include_worldwide": true},
     {"source": "himalayas", "country": "BY", "query": "Workflow Automation", "include_worldwide": true},
+    {"source": "himalayas", "country": "BY", "query": "Automation Engineer", "include_worldwide": true},
+    {"source": "himalayas", "country": "BY", "query": "n8n", "include_worldwide": true},
+    {"source": "himalayas", "country": "BY", "query": "Business Process Automation", "include_worldwide": true},
     {"source": "remotive", "query": "automation"},
     {"source": "hh", "query": "n8n OR \"AI автоматизация\" OR \"автоматизация бизнес-процессов\""}
   ]

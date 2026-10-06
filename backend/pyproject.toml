@@ -11,3 +11,6 @@ dependencies = ["psycopg[binary]>=3.2,<4"]
 
 [tool.setuptools.packages.find]
 include = ["app*"]
+
+[tool.setuptools.package-data]
+"app.api" = ["*.css"]

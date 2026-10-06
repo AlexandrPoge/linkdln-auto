@@ -1,10 +1,12 @@
 # Automated pipeline
 
-Run the local server, open `http://127.0.0.1:8765/`, and use **Автопилот → Gmail без пароля приложения** to connect a personal Gmail account through OAuth and the Gmail API over HTTPS (port 443). No app password or SMTP/IMAP connection is needed. Search runs independently even before connection. See [Gmail OAuth setup](gmail-oauth.md). Existing SMTP settings remain compatible, but the dashboard now offers OAuth as its primary connection method.
+Run the local server, open `http://127.0.0.1:8765/`, and use **Настройки подключения и отправки → Gmail без пароля приложения** to connect a personal Gmail account through OAuth and the Gmail API over HTTPS (port 443). No app password or SMTP/IMAP connection is needed. Search runs independently even before connection. See [Gmail OAuth setup](gmail-oauth.md). Existing SMTP settings remain compatible, but the dashboard now offers OAuth as its primary connection method.
 
 Choose a factual, reviewed resume PDF (absolute path, at most 5 MB). After OAuth connection, all email stages are paused until you enable the desired checkboxes and save: candidate digests, mailbox alerts, approved applications, and automatic approval. Saving then starts a full cycle and may send emails. **Искать сейчас** starts an extra cycle. Credentials never appear in dashboard responses or delivery error logs; settings and tokens are saved atomically in Git-ignored `data/` files, owner-only (0600), but not encrypted. Keep the checkout/data directory private.
 
 ## Sources and eligibility
+
+The current local preset and [example config](searches.example.json) include the public company boards for n8n, [Zapier](https://jobs.ashbyhq.com/zapier), and [Workato](https://job-boards.greenhouse.io/workato); five Belarus/worldwide Himalayas searches (AI Automation, Workflow Automation, Automation Engineer, n8n, Business Process Automation); one Remotive query; and one hh query. These are ten configured searches, not ten independent sites or guaranteed matches. More boards can be added after validating the actual public API format. Gumloop was not enabled because its live workplace fields were unsupported by the current adapter.
 
 Greenhouse/Ashby are company-specific public boards. Himalayas and Remotive are aggregators, not confirmation of employer hiring eligibility. Remotive listings link to and identify the source; its public feed is delayed by 24 hours. A persistent cooldown, including failed attempts/manual runs, limits Remotive to one request every six hours, as recommended in its [official API documentation](https://github.com/remotive-com/remote-jobs-api). The configuration accepts one Remotive query.
 
@@ -14,7 +16,7 @@ Automatic approval additionally requires the strict description screening below.
 
 ## Strict description screening
 
-Every full automation cycle screens up to 500 active stored vacancies, even when mail is disconnected. The deterministic filter has three outcomes:
+Every full automation cycle screens up to 2,000 active stored vacancy records in stable 200-record pages, even when mail is disconnected. This is bounded coverage, not an unlimited crawl. The deterministic filter has three outcomes:
 
 - `matched`: target engineer role, at least 80 characters of description, business/workflow responsibilities, two profile skills in the description, confirmed remote format and explicit residence/worldwide scope in the published text.
 - `manual`: insufficient description/skills, ambiguous remote mode, Europe/EMEA scope, unverified experience years, work authorization or minimum salary. These are retained for review, not automatically sent as a digest or autoapproved.
@@ -33,6 +35,14 @@ Enable native job alerts with email delivery to the connected Gmail. The Gmail A
 Up to 500 pending leads are classified per cycle. Recognizable unrelated/Senior titles are provisionally filtered based on unverified alert labels; generic action labels remain unknown. LinkedIn links with no full description remain `manual`; the app makes no LinkedIn website requests. hh links can resolve through fixed `GET https://api.hh.ru/vacancies/{numeric_id}` endpoints, never arbitrary email URLs. This stage has a persisted six-hour cooldown, at most eight detail requests per batch, and stops requests after the first source error. Blocked/cooldown leads stay available for a later check. Public API redirects are not followed. Resolved hh descriptions are imported without closing other boards and pass through the same strict filter. Profile changes reopen non-resolved alert classifications.
 
 This is not universal website automation: direct LinkedIn messages, recruiter conversation reading, and ATS-form submission are not implemented. Most public jobs have no application email. There is no invented recipient or fake successful send.
+
+## Reading the dashboard
+
+The Russian-language dashboard separates five sections: overview, vacancies, application queue, sources, and connection/sending settings. Belarus and international tabs are real search-track filters, not company-country claims. Overview screening counts are per-track unique source/job identities; contradictory duplicate results use the more restrictive status. Sent totals and the rolling 24-hour attempt cap cover both tracks.
+
+Confirmed textual matches are shown first. Manual-review jobs are separate; rejected jobs and their reasons are collapsed. Discovery shows only the latest 200 records, deduplicated by source/job identity, so its visible counts can differ from the whole-database overview. Identical queue drafts from additional queries are collapsed, not deleted; edited variants remain prominent and all edit/approval controls are preserved. Delivery still blocks repeated attempts for one source/job identity.
+
+Each configured search has its own access/status card. “New records” is an import count and can include the same job from multiple queries; it is not a count of suitable vacancies or applications. Stage summaries are human-readable. Settings are collapsed to keep the working screen readable, but remain editable locally. The interface uses bundled CSS, system fonts, no JavaScript/CDN dependency, keyboard focus styles, and a responsive mobile layout. The current foreground server is not proof that the optional login service is active.
 
 ## CLI and background service
 
