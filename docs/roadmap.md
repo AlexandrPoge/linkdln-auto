@@ -13,3 +13,12 @@
 8. **Batch and local scheduled search (implemented):** one `sync` command imports configured public sources and refreshes both review queues; `serve` runs it on startup and at a configured interval while the local process is alive. The dashboard can request an extra non-overlapping search, displays run status, and exposes filtered listings instead of looking empty. Search never sends applications. Always-on hosting and LinkedIn alert mailbox integration require separate setup and validation.
 
 Each stage should be reviewed and tested before beginning the next one.
+
+## Current automation stage (supersedes the earlier setup gaps)
+
+- Public sources: Remotive added with persistent rate limiting; hh remote Belarus adapter added and tested, but the live API currently returns HTTP 403. Existing sources remain independent.
+- Alert intake: read-only Gmail IMAP automatically collects direct LinkedIn/hh job links with durable cursors; links are separate unverified leads, not matched full vacancies. Redirect-only emails remain unsupported.
+- Full scheduled pipeline: optional deterministic automatic approval using published application addresses, scheduled approved email applications, candidate digests, rolling 24-hour caps, and durable delivery/outbox claims implemented and tested.
+- Local Gmail connection: localhost form verifies access without sending a test message and keeps credentials in ignored owner-only storage. Real email cannot run before the user connects the account.
+- Background operation: optional user macOS LaunchAgent starts/restarts the server. Docker/PostgreSQL and an awake connected Mac are still required; cloud hosting is not configured.
+- Remaining: hh authorized access, additional individually validated sources/application APIs, and account connection. Universal source coverage, LinkedIn DMs, and ATS submissions are not claimed.

@@ -1,5 +1,6 @@
 import json
 from collections.abc import Sequence
+from contextlib import contextmanager
 from typing import Any
 
 import psycopg
@@ -97,6 +98,33 @@ class Repository:
                 ON application_delivery_attempts (vacancy_source, vacancy_external_id)
                 WHERE vacancy_source IS NOT NULL AND vacancy_external_id IS NOT NULL
             """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS source_refreshes (
+                    source TEXT PRIMARY KEY, finished_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS mailbox_cursors (
+                    account TEXT PRIMARY KEY, epoch TEXT NOT NULL, last_uid BIGINT NOT NULL
+                )
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS alert_leads (
+                    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    source TEXT NOT NULL, external_id TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL,
+                    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(source, external_id)
+                )
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS job_notifications (
+                    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    source TEXT NOT NULL, external_id TEXT NOT NULL, title TEXT NOT NULL,
+                    url TEXT NOT NULL, kind TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sending','sent','uncertain')),
+                    external_reference TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE(source, external_id)
+                )
+            """)
 
     def save_profile(self, profile: CandidateProfile) -> None:
         with self._connect() as connection:
@@ -112,7 +140,7 @@ class Repository:
 
     def import_board(self, board_token: str, vacancies: Sequence[Vacancy], *, source: str = "greenhouse",
                      close_missing: bool = True) -> dict[str, int]:
-        if source not in {"greenhouse", "ashby", "himalayas"}:
+        if source not in {"greenhouse", "ashby", "himalayas", "hh", "remotive"}:
             raise ValueError("unsupported vacancy source")
         if any(job.source != source or job.board_token != board_token for job in vacancies):
             raise ValueError("all imported vacancies must belong to the requested source and board")
@@ -192,7 +220,8 @@ class Repository:
                 SELECT r.id, r.status, r.score, r.reasons, r.warnings, r.draft_text, r.recipient_email,
                        r.created_at, r.updated_at, r.approved_at,
                        d.status AS delivery_status, d.channel AS delivery_channel,
-                       v.source, v.company, v.title, v.location, v.description, v.url, v.is_active, v.search_track
+                       v.source, v.board_token, v.external_id, v.source_updated_at, v.last_seen_at,
+                       v.company, v.title, v.location, v.description, v.url, v.is_active, v.search_track
                 FROM application_reviews AS r
                 JOIN vacancies AS v ON v.id = r.vacancy_id
                 LEFT JOIN application_delivery_attempts AS d ON d.review_id = r.id
@@ -215,17 +244,28 @@ class Repository:
                 FROM application_reviews AS r
                 JOIN vacancies AS v ON v.id = r.vacancy_id
                 WHERE r.status = 'approved' AND v.is_active = TRUE
+                  AND v.last_seen_at > now() - interval '24 hours'
                   AND (%s::text IS NULL OR v.search_track = %s)
-                  AND NOT EXISTS (SELECT 1 FROM application_delivery_attempts AS d WHERE d.review_id = r.id)
+                  AND r.recipient_email IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM application_delivery_attempts AS d
+                                  WHERE d.review_id = r.id OR (d.vacancy_source = v.source AND d.vacancy_external_id = v.external_id))
                 ORDER BY r.approved_at, r.id
                 LIMIT %s
             """, (track, track, limit)).fetchall()
         return [dict(row) for row in rows]
 
-    def claim_delivery(self, review_id: int, channel: str, expected_recipient: str | None = None) -> int | None:
+    def claim_delivery(self, review_id: int, channel: str, expected_recipient: str | None = None,
+                       *, daily_limit: int | None = None) -> int | None:
         if review_id <= 0 or not channel or len(channel) > 50:
             raise ValueError("invalid delivery claim")
         with self._connect() as connection:
+            if daily_limit is not None:
+                if type(daily_limit) is not int or not 1 <= daily_limit <= 10:
+                    raise ValueError("daily limit must be 1 to 10")
+                connection.execute("SELECT pg_advisory_xact_lock(8765002)")
+                count = connection.execute("SELECT count(*) AS n FROM application_delivery_attempts WHERE started_at > now() - interval '24 hours'").fetchone()["n"]
+                if count >= daily_limit:
+                    return None
             row = connection.execute("""
                 INSERT INTO application_delivery_attempts
                     (review_id, vacancy_source, vacancy_external_id, channel)
@@ -256,6 +296,107 @@ class Repository:
                   AND NOT EXISTS (SELECT 1 FROM application_delivery_attempts AS d WHERE d.review_id = r.id)
             """, (address, review_id)).rowcount
         return changed == 1
+
+    @contextmanager
+    def automation_lock(self):
+        with self._connect() as connection:
+            acquired = connection.execute("SELECT pg_try_advisory_lock(8765001) AS acquired").fetchone()["acquired"]
+            try:
+                yield acquired
+            finally:
+                if acquired:
+                    connection.execute("SELECT pg_advisory_unlock(8765001)")
+
+    def claim_source_refresh(self, source: str, seconds: int) -> bool:
+        with self._connect() as connection:
+            row = connection.execute("""
+                INSERT INTO source_refreshes(source) VALUES (%s)
+                ON CONFLICT(source) DO UPDATE SET finished_at = now()
+                WHERE source_refreshes.finished_at < now() - %s * interval '1 second'
+                RETURNING source
+            """, (source, seconds)).fetchone()
+        return row is not None
+
+    def mailbox_cursor(self, account: str, epoch: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute("SELECT last_uid FROM mailbox_cursors WHERE account = %s AND epoch = %s", (account, epoch)).fetchone()
+        return row["last_uid"] if row else 0
+
+    def save_mailbox_cursor(self, account: str, epoch: str, uid: int) -> None:
+        with self._connect() as connection:
+            connection.execute("""
+                INSERT INTO mailbox_cursors(account, epoch, last_uid) VALUES (%s, %s, %s)
+                ON CONFLICT(account) DO UPDATE SET epoch = EXCLUDED.epoch, last_uid = EXCLUDED.last_uid
+            """, (account, epoch, uid))
+
+    def save_alert_leads(self, links: list[dict]) -> int:
+        added = 0
+        with self._connect() as connection:
+            for link in links:
+                added += connection.execute("""
+                    INSERT INTO alert_leads(source, external_id, title, url) VALUES (%s, %s, %s, %s)
+                    ON CONFLICT(source, external_id) DO NOTHING
+                """, (link["source"], link["external_id"], link["title"], link["url"])).rowcount
+        return added
+
+    def list_alert_leads(self, limit: int = 20) -> list[dict]:
+        if not 1 <= limit <= 100:
+            raise ValueError("lead limit must be 1 to 100")
+        with self._connect() as connection:
+            return [dict(row) for row in connection.execute("SELECT * FROM alert_leads ORDER BY first_seen_at DESC, id DESC LIMIT %s", (limit,)).fetchall()]
+
+    def auto_approve_review(self, row: dict, recipient: str) -> int:
+        if not is_email_address(recipient):
+            raise ValueError("invalid published application email")
+        with self._connect() as connection:
+            return connection.execute("""
+                UPDATE application_reviews AS r SET status = 'approved', approved_at = now(),
+                    recipient_email = %s, updated_at = now()
+                FROM vacancies AS v WHERE r.id = %s AND r.vacancy_id = v.id AND v.is_active
+                    AND r.status = 'draft' AND r.draft_text = %s AND v.description = %s AND v.location = %s AND v.title = %s
+            """, (recipient, row["id"], row["draft_text"], row["description"], row["location"], row["title"])).rowcount
+
+    def enqueue_notifications(self) -> None:
+        with self._connect() as connection:
+            connection.execute("""
+                INSERT INTO job_notifications(source, external_id, title, url, kind)
+                SELECT v.source, v.external_id, v.title || ' — ' || v.company, v.url, 'Прошла первичный фильтр'
+                FROM application_reviews AS r JOIN vacancies AS v ON v.id = r.vacancy_id
+                WHERE r.status != 'rejected' AND v.is_active
+                ON CONFLICT(source, external_id) DO NOTHING
+            """)
+            connection.execute("""
+                INSERT INTO job_notifications(source, external_id, title, url, kind)
+                SELECT source, external_id, title, url, 'Ссылка из письма; условия не проверены' FROM alert_leads
+                ON CONFLICT(source, external_id) DO NOTHING
+            """)
+
+    def claim_notifications(self, limit: int = 25) -> list[dict]:
+        if not 1 <= limit <= 25:
+            raise ValueError("notification limit must be 1 to 25")
+        with self._connect() as connection:
+            rows = connection.execute("""
+                WITH pending AS (SELECT n.id FROM job_notifications AS n WHERE n.status = 'pending'
+                    AND (n.kind = 'Ссылка из письма; условия не проверены' OR EXISTS (
+                        SELECT 1 FROM application_reviews AS r JOIN vacancies AS v ON v.id = r.vacancy_id
+                        WHERE v.source = n.source AND v.external_id = n.external_id AND v.is_active AND r.status != 'rejected'))
+                    ORDER BY n.id LIMIT %s FOR UPDATE OF n SKIP LOCKED)
+                UPDATE job_notifications AS n SET status = 'sending' FROM pending
+                WHERE n.id = pending.id RETURNING n.*
+            """, (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def finish_notifications(self, ids: list[int], *, sent: bool, reference: str = "") -> None:
+        with self._connect() as connection:
+            connection.execute("UPDATE job_notifications SET status = %s, external_reference = %s WHERE id = ANY(%s) AND status = 'sending'", ("sent" if sent else "uncertain", reference[:200] or None, ids))
+
+    def automation_stats(self) -> dict:
+        with self._connect() as connection:
+            sent = connection.execute("SELECT count(*) AS n FROM application_delivery_attempts WHERE status = 'sent'").fetchone()["n"]
+            pending = connection.execute("SELECT count(*) AS n FROM job_notifications WHERE status = 'pending'").fetchone()["n"]
+            uncertain = connection.execute("SELECT count(*) AS n FROM application_delivery_attempts WHERE status IN ('uncertain','sending')").fetchone()["n"]
+            uncertain += connection.execute("SELECT count(*) AS n FROM job_notifications WHERE status IN ('uncertain','sending')").fetchone()["n"]
+        return {"sent_total": sent, "notification_pending": pending, "uncertain_total": uncertain}
 
     def finish_delivery(self, attempt_id: int, *, sent: bool, reference: str = "", error: str = "") -> None:
         if attempt_id <= 0:

@@ -12,7 +12,9 @@ from app.candidate.profile import CandidateProfile
 from app.api.review import serve
 from app.api.search_runner import SearchRunner
 from app.applications.delivery import deliver_approved
+from app.applications.automation import AutomationPipeline, SettingsStore
 from app.infrastructure.persistence.postgres import Repository
+from app.infrastructure.local_service import install_service
 from app.integrations.email_sender import SMTPApplicationSender, SMTPSettings
 from app.integrations.job_sources.ashby import AshbySourceError, fetch_board as fetch_ashby_board
 from app.integrations.job_sources.greenhouse import SourceError, fetch_board
@@ -60,7 +62,7 @@ def main() -> int:
     matches.add_argument("--limit", type=int, default=50)
     matches.add_argument("--include-rejected", action="store_true")
     matches.add_argument("--track", choices=SEARCH_TRACKS, help="Filter Belarus or international search")
-    server = commands.add_parser("serve", help="Open the local review queue (does not send applications)")
+    server = commands.add_parser("serve", help="Run the local search and configured email automation")
     server.add_argument("--port", type=int, default=8765)
     server.add_argument("--config", type=Path, help="Search config; defaults to local data/searches.json if present")
     server.add_argument("--interval-minutes", type=int, default=360,
@@ -73,6 +75,12 @@ def main() -> int:
     alert.add_argument("file", type=Path, help="Locally saved LinkedIn Job Alert .eml file")
     sync = commands.add_parser("sync", help="Fetch configured public sources and refresh unsent review queues")
     sync.add_argument("--config", type=Path, required=True, help="JSON search configuration")
+    pipeline = commands.add_parser("run-automation", help="Run configured search, mailbox, digest, and application delivery once")
+    pipeline.add_argument("--config", type=Path, required=True)
+    service = commands.add_parser("install-service", help="Start automation in the background and at macOS login")
+    service.add_argument("--config", type=Path, required=True)
+    service.add_argument("--port", type=int, default=8765)
+    service.add_argument("--interval-minutes", type=int, default=360)
     args = parser.parse_args()
 
     if args.command == "inspect-linkedin-alert":
@@ -99,9 +107,11 @@ def main() -> int:
         elif args.command == "profile":
             saved = repository.get_profile()
             print(json.dumps(saved.to_dict() if saved else None, ensure_ascii=False, indent=2))
-        elif args.command == "sync":
+        elif args.command in {"sync", "run-automation"}:
             plan = _load_search_plan(args.config)
-            result = run_searches(repository, plan)
+            store = SettingsStore(Path(__file__).resolve().parents[2] / "data" / "automation.json")
+            result = (AutomationPipeline(repository, store)(repository, plan)
+                      if args.command == "run-automation" else run_searches(repository, plan))
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 1 if result["failed"] else 0
         elif args.command == "import":
@@ -128,14 +138,20 @@ def main() -> int:
         elif args.command == "vacancies":
             print(json.dumps(repository.list_vacancies(args.limit, active_only=not args.all, track=args.track),
                              ensure_ascii=False, indent=2, default=_json_default))
+        elif args.command == "install-service":
+            _load_search_plan(args.config)
+            path = install_service(database_url, args.config, port=args.port, interval_minutes=args.interval_minutes)
+            print(f"Background service installed: {path}")
         elif args.command == "serve":
             if not 5 <= args.interval_minutes <= 1440:
                 raise ValueError("interval must be 5 to 1440 minutes")
             default_config = Path(__file__).resolve().parents[2] / "data" / "searches.json"
             config = args.config or (default_config if default_config.is_file() else None)
-            runner = SearchRunner(repository, _load_search_plan(config), args.interval_minutes * 60) if config else None
+            automation = AutomationPipeline(repository, SettingsStore(default_config.parent / "automation.json"))
+            runner = SearchRunner(repository, _load_search_plan(config), args.interval_minutes * 60,
+                                  search_fn=automation) if config else None
             try:
-                serve(repository, args.port, search_runner=runner)
+                serve(repository, args.port, search_runner=runner, automation=automation)
             except KeyboardInterrupt:
                 print("\nReview queue stopped")
         elif args.command == "send-approved":

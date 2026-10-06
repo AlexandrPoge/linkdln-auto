@@ -89,18 +89,33 @@ class SMTPApplicationSender:
         message.set_content(review["draft_text"])
         message.add_attachment(settings.resume_bytes, maintype="application", subtype="pdf",
                                filename=settings.resume_filename)
-        context = ssl.create_default_context()
-        if settings.security == "ssl":
-            with smtplib.SMTP_SSL(settings.host, settings.port, timeout=20, context=context) as smtp:
-                smtp.login(settings.username, settings.password)
-                refused = smtp.send_message(message)
-        else:
-            with smtplib.SMTP(settings.host, settings.port, timeout=20) as smtp:
-                smtp.ehlo()
-                smtp.starttls(context=context)
-                smtp.ehlo()
-                smtp.login(settings.username, settings.password)
-                refused = smtp.send_message(message)
-        if refused:
-            raise RuntimeError("the SMTP server rejected one or more recipients")
+        _send_message(settings, message)
         return message_id
+
+
+def _send_message(settings: SMTPSettings, message: EmailMessage) -> None:
+    context = ssl.create_default_context()
+    if settings.security == "ssl":
+        with smtplib.SMTP_SSL(settings.host, settings.port, timeout=20, context=context) as smtp:
+            smtp.login(settings.username, settings.password)
+            refused = smtp.send_message(message)
+    else:
+        with smtplib.SMTP(settings.host, settings.port, timeout=20) as smtp:
+            smtp.ehlo()
+            smtp.starttls(context=context)
+            smtp.ehlo()
+            smtp.login(settings.username, settings.password)
+            refused = smtp.send_message(message)
+    if refused:
+        raise RuntimeError("the SMTP server rejected one or more recipients")
+
+
+def send_email(settings: SMTPSettings, recipient: str, subject: str, body: str) -> str:
+    if not is_email_address(recipient):
+        raise ValueError("invalid digest recipient")
+    message = EmailMessage()
+    message["From"], message["To"], message["Subject"] = settings.from_email, recipient, subject
+    message["Message-ID"] = make_msgid()
+    message.set_content(body)
+    _send_message(settings, message)
+    return str(message["Message-ID"])

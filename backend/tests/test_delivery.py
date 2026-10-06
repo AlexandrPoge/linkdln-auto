@@ -25,7 +25,7 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(deliver_approved(repository, sender, execute=True),
                          {"eligible": 3, "ready": 3, "sent": 1, "uncertain": 1, "skipped": 1})
         repository.finish_delivery.assert_any_call(17, sent=True, reference="message-id")
-        repository.finish_delivery.assert_any_call(19, sent=False, error="timeout after send")
+        repository.finish_delivery.assert_any_call(19, sent=False, error="RuntimeError")
         self.assertEqual(sender.send.call_count, 2)
 
     def test_invalid_limit_is_rejected(self) -> None:

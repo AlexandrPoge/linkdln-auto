@@ -41,7 +41,41 @@ class RepositoryTests(unittest.TestCase):
 
     def setUp(self) -> None:
         with psycopg.connect(self.repository.database_url) as connection:
-            connection.execute("TRUNCATE application_delivery_attempts, application_reviews, vacancies, candidate_profiles RESTART IDENTITY")
+            connection.execute("TRUNCATE job_notifications, alert_leads, mailbox_cursors, source_refreshes, application_delivery_attempts, application_reviews, vacancies, candidate_profiles RESTART IDENTITY")
+
+    def test_source_throttle_and_notification_claim_survive_repeated_calls(self):
+        self.assertTrue(self.repository.claim_source_refresh("remotive", 21600))
+        self.assertFalse(self.repository.claim_source_refresh("remotive", 21600))
+        link = {"source": "linkedin", "external_id": "12345678", "title": "Engineer",
+                "url": "https://www.linkedin.com/jobs/view/12345678/"}
+        self.assertEqual(self.repository.save_alert_leads([link]), 1)
+        self.assertEqual(self.repository.save_alert_leads([link]), 0)
+        self.repository.enqueue_notifications()
+        self.repository.enqueue_notifications()
+        items = self.repository.claim_notifications()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(self.repository.claim_notifications(), [])
+        self.repository.finish_notifications([items[0]["id"]], sent=False)
+        self.assertEqual(self.repository.claim_notifications(), [])
+        self.assertEqual(self.repository.automation_stats()["uncertain_total"], 1)
+
+    def test_mailbox_epoch_resets_cursor(self):
+        self.repository.save_mailbox_cursor("account", "one", 9)
+        self.assertEqual(self.repository.mailbox_cursor("account", "one"), 9)
+        self.assertEqual(self.repository.mailbox_cursor("account", "two"), 0)
+
+    def test_application_cap_is_atomic_and_counts_uncertain_attempts(self):
+        self.repository.import_board("integrationtest", [_vacancy("1"), _vacancy("2")])
+        self.repository.enqueue_reviews([QueueCandidate(row["id"], 80, (), (), "Draft")
+                                         for row in self.repository.list_vacancies()])
+        ids = [row["id"] for row in self.repository.list_reviews()]
+        self.repository.approve_reviews(ids)
+        for review_id in ids:
+            self.repository.set_review_recipient(review_id, "jobs@example.com")
+        attempt = self.repository.claim_delivery(ids[0], "email", "jobs@example.com", daily_limit=1)
+        self.assertIsNotNone(attempt)
+        self.repository.finish_delivery(attempt, sent=False)
+        self.assertIsNone(self.repository.claim_delivery(ids[1], "email", "jobs@example.com", daily_limit=1))
 
     def test_profile_round_trip(self) -> None:
         profile = CandidateProfile.from_dict({

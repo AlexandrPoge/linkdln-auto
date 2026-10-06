@@ -29,6 +29,12 @@ def _job(**overrides: object) -> Vacancy:
 
 
 class MatchingTests(unittest.TestCase):
+    def test_russian_business_automation_is_matched_but_industrial_and_qa_are_not(self):
+        profile = _profile(roles=["Automation Engineer"])
+        self.assertEqual(evaluate(profile, _job(title="Инженер по автоматизации бизнес-процессов")).status, "review")
+        self.assertEqual(evaluate(profile, _job(title="Инженер по автоматизации тестирования")).status, "rejected")
+        self.assertEqual(evaluate(profile, _job(title="Industrial Automation Engineer PLC")).status, "rejected")
+
     def test_automation_engineer_focus_rejects_backend_titles_despite_shared_skills(self) -> None:
         profile = _profile(roles=["Automation Engineer"])
         backend = _job(title="Senior Backend Engineer", description="Build Go APIs and n8n workflows.")

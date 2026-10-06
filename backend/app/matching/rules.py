@@ -15,14 +15,16 @@ _NEGATED_REMOTE = re.compile(r"\b(no|not)\s+remote\b", re.IGNORECASE)
 _OFFICE = re.compile(r"\b(on[ -]?site|office|hybrid|гибрид\w*|офис\w*)\b", re.IGNORECASE)
 _SENIOR_TITLE = re.compile(r"\b(senior|sr\.?|staff|principal|lead|head|director|manager)\b", re.IGNORECASE)
 _MANAGEMENT_TITLE = re.compile(r"\b(manager|head|director)\b", re.IGNORECASE)
-_QA_TITLE = re.compile(r"\b(QA|quality assurance|test automation|automation test)\b", re.IGNORECASE)
+_QA_TITLE = re.compile(r"\b(QA|quality assurance|test automation|automation test|тестирован\w*|тестиров\w*)\b", re.IGNORECASE)
+_INDUSTRIAL_TITLE = re.compile(r"\b(PLC|SCADA|industrial|controls|robotics|АСУ\w*|КИП\w*)\b", re.IGNORECASE)
 _NON_EU_SCOPE = re.compile(r"\b(us|usa|united states|canada|australia|india|apac|americas|north america)\b", re.IGNORECASE)
 _BROAD_SCOPE = re.compile(r"\b(europe|emea|worldwide|anywhere|global)\b", re.IGNORECASE)
 _RESIDENCE_ALIASES = {"united kingdom": ("UK",), "united states": ("US", "USA")}
 
 
 def _words(value: str) -> set[str]:
-    return set(re.findall(r"\w+", value.casefold()))
+    words = set(re.findall(r"\w+", value.casefold()))
+    return {"automation" if word.startswith("автоматизац") else word for word in words}
 
 
 def _role_types(value: str) -> set[str]:
@@ -97,6 +99,8 @@ class MatchResult:
 def evaluate(profile: CandidateProfile, vacancy: Vacancy) -> MatchResult:
     """Rank a vacancy for human review; never decide that an application may be sent."""
     title = vacancy.title.casefold()
+    if _INDUSTRIAL_TITLE.search(title) and not any(_INDUSTRIAL_TITLE.search(role) for role in profile.roles):
+        return MatchResult("rejected", 0, ("Industrial automation is outside the target roles.",), (), ())
     if _MANAGEMENT_TITLE.search(title) and not any(_MANAGEMENT_TITLE.search(role) for role in profile.roles):
         return MatchResult("rejected", 0, ("Management role is outside the target roles.",), (), ())
     if _QA_TITLE.search(title) and not any(_QA_TITLE.search(role) for role in profile.roles):

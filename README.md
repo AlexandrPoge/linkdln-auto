@@ -1,8 +1,8 @@
 # linkdln-auto
 
-Personal job-search assistant. The first version will collect vacancies, filter them against a candidate profile, prepare application drafts from templates, and present a batch for approval before sending. It does not use AI.
+Local job-search automation for a remote Automation Engineer based in Belarus. It searches configured public sources, filters vacancies, prepares factual messages, reads job-alert emails, sends candidate digests, and delivers configured email applications. It does not use AI.
 
-Candidate profiles and vacancies are stored in PostgreSQL. The local CLI imports public Greenhouse and Ashby job boards and searches Himalayas, deterministic rules rank vacancies, and a localhost review queue lets the candidate edit drafts and approve a selected batch. A first delivery path sends approved applications by email **only when an employer application address is entered explicitly**. It is disabled unless `send-approved --execute` is run with SMTP and resume PDF settings. Nothing is submitted on import, match, queue refresh, or approval.
+Candidate profiles, vacancies, and delivery history are stored in PostgreSQL. Sources include Greenhouse, Ashby, Himalayas, Remotive, and an hh adapter. The dashboard supports local Gmail connection, read-only LinkedIn/hh alert intake, scheduled email delivery, and optional narrow deterministic automatic approval using explicitly published application addresses. Direct LinkedIn messages and ATS-form submission are not implemented. Gmail must be connected before email can run. See [automation setup and limits](docs/automation.md).
 
 ## Structure
 
@@ -46,7 +46,7 @@ The `data/` directory is ignored by Git. A local `data/profile.json` based on th
 
 `sync --config ../data/searches.json` is a one-shot search: it fetches each configured public source, updates the database, and refreshes the Belarus and international review queues. It never approves or sends an application. The local `data/searches.json` currently includes n8n's Ashby board and a Belarus-scoped Himalayas query; a template is in [docs/searches.example.json](docs/searches.example.json). Failed sources are reported individually and are not treated as a reason to close their previous listings. Do not put passwords in the search config.
 
-With a valid search config, `serve` starts one search immediately and repeats it every 360 minutes by default **while the server process remains running**. `--interval-minutes` accepts 5–1440. The dashboard's **Искать сейчас** button starts an extra run without overlapping an existing one. The page shows last-run counts, active vacancies, near-topic results, and why a listing failed the current filter. If `data/searches.json` exists in the repo, `serve` picks it up automatically; `--config` can select another file. This is not an always-on cloud service: stopping the local server or shutting down the computer stops the schedule. LinkedIn alert emails and LinkedIn messages are not connected to this loop.
+With a valid search config, `serve` starts a full configured pipeline immediately and repeats every 360 minutes **while the process is running**. This may send emails if Gmail is connected and sending enabled. `--interval-minutes` accepts 5–1440. **Искать сейчас** runs another non-overlapping cycle. Remotive has a persistent six-hour request cooldown. The page shows source errors, stage results, drafts, alert links, and delivery history. An optional macOS background service starts the server at login and restarts it; Docker/PostgreSQL and an awake connected computer remain required. LinkedIn email alerts are part of this loop, but LinkedIn DMs are not.
 
 The Himalayas importer uses its [public Remote Jobs API](https://himalayas.app/docs/remote-jobs-api). The current CLI search supports the saved Belarus profile with country code `BY`. By default it excludes jobs the aggregator labels only as worldwide and keeps those whose published location restrictions explicitly include Belarus. `--include-worldwide` is optional, but it does **not** verify employer eligibility. Himalayas is an aggregator, so its classification is never treated as confirmation from the employer; the review page shows source attribution and a warning. Search imports do not close missing jobs because search results can shift or be incomplete; verify that a posting is still live before approval. Do not republish these listings to other job sites.
 
@@ -67,9 +67,13 @@ cd backend
 ../.venv/bin/python -m app inspect-linkedin-alert ../data/linkedin-alert.eml
 ```
 
-The command needs no database or email credentials. It extracts only direct LinkedIn job links and unverified anchor labels; a real alert sample is still needed before this can become a reliable queue importer. Keep original alert emails in the Git-ignored `data/` directory because they may contain personal tracking links.
+The command needs no database or email credentials. It extracts direct LinkedIn job links and unverified anchor labels. The dashboard also supports scheduled read-only Gmail intake of these links; they remain separate unverified leads, not matched vacancies. Keep original alert emails in the Git-ignored `data/` directory because they may contain personal tracking links.
 
-## Email delivery (opt-in)
+## Email delivery
+
+The dashboard's **Автопилот** form connects Gmail locally and enables scheduled applications/digests according to its checkboxes. Google app passwords require two-step verification; enter one only in the localhost form, never in chat. Settings stay in ignored `data/automation.json` with owner-only permissions (0600), not encrypted. Defaults cap applications at 5 per rolling 24 hours. Missing application addresses leave jobs in review. See [docs/automation.md](docs/automation.md) for the full workflow, limitations, and background service.
+
+The older environment-based CLI below remains a separate, preview-by-default delivery path; it does not use the dashboard's saved Gmail settings.
 
 For an approved draft, enter **the application email explicitly published by that employer** in the local review page. Do not guess HR addresses. Configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURITY` (`ssl` or `starttls`), `SMTP_USERNAME`, `SMTP_PASSWORD`, and the absolute `RESUME_PDF_PATH` locally; the resume must be a PDF of at most 5 MB. `SMTP_FROM` may be set explicitly or taken from the locally saved profile's `contact_email`. Never commit credentials or the personal profile file. The sender email must be an address you control, so employers can reply. The generated resume is separate from the repository at `../pdf/Aliaksandr_Poge_AI_Automation_Resume.pdf`; review it before using it in real applications.
 

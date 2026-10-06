@@ -4,7 +4,7 @@ import threading
 import unittest
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from urllib.parse import urlencode
 
 from app.api.review import make_handler, render_page
@@ -22,6 +22,37 @@ def _review() -> dict:
 
 
 class ReviewPageTests(unittest.TestCase):
+    @patch("app.api.review.verify_gmail")
+    def test_gmail_form_checks_csrf_then_verifies_without_echoing_password(self, verify):
+        from app.applications.automation import AutomationSettings
+        repository, runner, automation = Mock(), Mock(), Mock()
+        automation.store.load.return_value = AutomationSettings()
+        runner.trigger.return_value = True
+        handler_class = make_handler(repository, "test-token", runner, automation)
+
+        def submit(token):
+            body = urlencode({"csrf": token, "email": "example@gmail.com", "password": "a" * 16,
+                              "daily_limit": "5", "notifications": "yes", "mailbox": "yes"}).encode()
+            handler = object.__new__(handler_class)
+            handler.server = SimpleNamespace(server_port=8765)
+            handler.headers = {"Host": "127.0.0.1:8765", "Content-Length": str(len(body)),
+                               "Content-Type": "application/x-www-form-urlencoded"}
+            handler.path = "/automation-settings"
+            handler.rfile, handler.wfile = io.BytesIO(body), io.BytesIO()
+            handler.send_response, handler.send_header, handler.end_headers = Mock(), Mock(), Mock()
+            handler.do_POST()
+            return handler
+
+        bad = submit("wrong")
+        self.assertEqual(bad.send_response.call_args.args[0], 403)
+        verify.assert_not_called()
+        good = submit("test-token")
+        self.assertEqual(good.send_response.call_args.args[0], 303)
+        verify.assert_called_once_with("example@gmail.com", "a" * 16)
+        automation.store.save.assert_called_once()
+        runner.trigger.assert_called_once()
+        self.assertNotIn("a" * 16, str(good.send_header.call_args_list))
+
     def test_post_route_checks_token_and_confirmation_without_a_socket(self) -> None:
         repository = Mock()
         repository.approve_reviews.return_value = 1
@@ -54,7 +85,7 @@ class ReviewPageTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", page)
         self.assertIn("Hello &lt;team&gt; &amp; friends", page)
         self.assertNotIn("<script>", page)
-        self.assertIn("Отклик не отправляется", page)
+        self.assertIn("если Gmail подключён и отправка включена", page)
         self.assertIn('href="/?track=belarus"', page)
         self.assertIn('href="/?track=international"', page)
         self.assertIn('name="track" value="belarus"', page)

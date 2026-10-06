@@ -8,6 +8,8 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 from app.applications.queue import refresh_queue
 from app.api.search_runner import SearchRunner
+from app.applications.automation import AutomationPipeline, AutomationSettings
+from app.integrations.mailbox import verify_gmail
 from app.candidate.profile import CandidateProfile
 from app.infrastructure.persistence.postgres import Repository
 from app.matching.rules import evaluate
@@ -41,6 +43,7 @@ def _display_reason(reason: str) -> str:
     translations = {
         "Management role is outside the target roles.": "Руководящая позиция вне текущего поиска.",
         "QA/test automation is outside the target roles.": "QA-автоматизация вне текущего поиска.",
+        "Industrial automation is outside the target roles.": "Промышленная автоматизация вне текущего поиска.",
         "Job title does not match target roles.": "Название не совпадает с целевой ролью.",
         "Job title does not match the target role type.": "Тип роли не совпадает с целевой инженерной позицией.",
         "Vacancy explicitly excludes remote work.": "Вакансия исключает удалённую работу.",
@@ -67,7 +70,7 @@ def _search_status(search_status: dict[str, Any] | None) -> str:
     elif report := search_status["report"]:
         new_count = sum(int(item.get("new", 0)) for item in report["sources"] if item["status"] == "ok")
         summary = (f"Последний запуск · источников проверено: {report['successful']} · "
-                   f"ошибок: {report['failed']} · новых вакансий: {new_count}. Ничего не отправлено.")
+                   f"ошибок: {report['failed']} · новых вакансий: {new_count} · отправлено откликов: {report.get('sent', 0)}.")
         style = "ok" if not report["failed"] else "error"
     else:
         summary = "Первый поиск запустится при открытии сервера."
@@ -76,8 +79,54 @@ def _search_status(search_status: dict[str, Any] | None) -> str:
     when = datetime.fromisoformat(finished).astimezone().strftime("%d.%m.%Y %H:%M") if finished else "ещё не завершён"
     hours = search_status["interval_seconds"] // 3600
     interval = f"каждые {hours} ч" if hours else f"каждые {search_status['interval_seconds'] // 60} мин"
+    report = search_status.get("report") or {}
+    source_details = "".join(f'<li>{_escape(item["source"])} · {_escape(item["status"])} · '
+                             f'{_escape(item.get("error") or item.get("note") or str(item.get("total", 0)) + " вакансий")}</li>'
+                             for item in report.get("sources", []))
+    stage_details = "".join(f'<li>{_escape(key)}: {_escape(value)}</li>' for key, value in report.get("automation", {}).items())
     return (f'<p class="run-status {style}" role="status">{summary}</p>'
-            f'<p class="muted">Последняя проверка: {_escape(when)} · Повтор: {interval}, пока приложение запущено.</p>')
+            f'<p class="muted">Последняя проверка: {_escape(when)} · Повтор: {interval}, пока приложение запущено.</p>'
+            f'<details><summary>Источники и результаты этапов</summary><ul>{source_details}{stage_details}</ul></details>')
+
+
+def _automation_panel(state: dict | None, csrf: str, track: str, profile: CandidateProfile | None) -> str:
+    if state is None:
+        return ""
+    connected = state["connected"]
+    email = state["email"] or (profile.contact_email if profile else "") or ""
+    resume = state["resume_path"]
+    if not resume:
+        from pathlib import Path
+        default = Path(__file__).resolve().parents[4] / "pdf" / "Aliaksandr_Poge_AI_Automation_Resume.pdf"
+        if default.is_file():
+            resume = str(default)
+    flags = "".join(f'<label class="pick"><input type="checkbox" name="{name}" value="yes" '
+                    f'{"checked" if state[name] else ""}> {label}</label>' for name, label in (
+        ("notifications", "Присылать новые предложения на мою почту"),
+        ("mailbox", "Забирать LinkedIn/hh-уведомления из Gmail INBOX"),
+        ("send_applications", "Отправлять утверждённые отклики автоматически"),
+        ("auto_approve", "Без ручного утверждения: подходящая вакансия + опубликованный адрес для резюме")))
+    leads = "".join(f'<article class="discovery-card"><span class="muted">{_escape(item["source"])}</span>'
+                    f'<h3>{_escape(item["title"])}</h3>{_vacancy_link(item["url"])}</article>'
+                    for item in state.get("leads", []))
+    return f'''<section class="search-panel"><h2>Автопилот</h2>
+<p class="run-status {'ok' if connected else 'error'}">{'Gmail подключён' if connected else 'Один шаг до отправки: подключи Gmail'}</p>
+<div class="metrics"><div class="metric"><strong>{state['sent_total']}</strong><span>Откликов отправлено</span></div>
+<div class="metric"><strong>{state['notification_pending']}</strong><span>Новых предложений ждут доставки</span></div>
+<div class="metric"><strong>{state['uncertain_total']}</strong><span>Неясных результатов — без повторов</span></div></div>
+<p>Поиск → фильтр → сообщение по шаблону → отправка → история. Без AI.</p>
+<p class="muted">Автоутверждение: свежие Greenhouse/Ashby вакансии, минимум 2 совпавших навыка, удалёнка Worldwide или Belarus и один явно опубликованный адрес для отклика. Остальные — в очереди ниже.</p>
+<details {'open' if not connected else ''}><summary>Почта и настройки отправки</summary>
+<form method="post" action="/automation-settings"><input type="hidden" name="csrf" value="{_escape(csrf)}"><input type="hidden" name="track" value="{track}">
+<label>Твой Gmail<input type="email" name="email" value="{_escape(email)}" required autocomplete="username"></label>
+<label>Пароль приложения Google (не пароль аккаунта)<input type="password" name="password" {'required' if not connected else ''} autocomplete="new-password" placeholder="{'Оставь пустым, чтобы сохранить подключение' if connected else '16 символов'}"></label>
+<p class="muted">Нужна двухэтапная проверка. <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer">Создать пароль приложения ↗</a>. Вводи его только здесь, не в чате. Доступ проверяется без отправки тестового письма.</p>
+<label>Полный путь к резюме PDF<input type="text" name="resume_path" value="{_escape(resume)}"></label>
+<label>Максимум откликов за 24 часа<input type="number" name="daily_limit" min="1" max="10" value="{state['daily_limit']}" required></label>
+{flags}<p class="muted">Пароль хранится локально в игнорируемом Git файле с доступом только для владельца (0600). Письма читаются без отметки «прочитано». Данные Gmail не отправляются источникам вакансий.</p>
+<button type="submit">{'Сохранить и запустить цикл' if connected else 'Подключить Gmail и запустить'}</button></form></details>
+<p class="muted">Ссылки из уведомлений не считаются проверенными вакансиями. Чтобы LinkedIn поступал сюда, включи его Job Alerts с доставкой на этот Gmail. Прямые LinkedIn-сообщения и ATS-формы этот канал не отправляет.</p>
+{'<h3>Из почтовых уведомлений</h3><div class="discovery-list">' + leads + '</div>' if leads else ''}</section>'''
 
 
 def _discovered_vacancies(rows: list[dict[str, Any]], profile: CandidateProfile | None) -> tuple[str, int]:
@@ -129,7 +178,7 @@ def _discovered_vacancies(rows: list[dict[str, Any]], profile: CandidateProfile 
 def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
                 track: str = "belarus", profile: CandidateProfile | None = None,
                 discovered: list[dict[str, Any]] | None = None,
-                search_status: dict[str, Any] | None = None) -> str:
+                search_status: dict[str, Any] | None = None, automation_state: dict | None = None) -> str:
     if track not in SEARCH_TRACKS:
         raise ValueError("invalid search track")
     track_input = f'<input type="hidden" name="track" value="{track}">'
@@ -188,6 +237,8 @@ def render_page(rows: list[dict[str, Any]], csrf_token: str, notice: str = "",
                 </form>'''
         stale = '<p class="warning">Вакансия закрыта — утверждение недоступно.</p>' if not row["is_active"] else ""
         source_note = '<p class="warning">Источник: <a href="https://himalayas.app/" target="_blank" rel="noopener noreferrer">Himalayas</a>. Условия проверяй у работодателя.</p>' if row.get("source") == "himalayas" else ""
+        if row.get("source") == "remotive":
+            source_note = '<p class="warning">Источник: <a href="https://remotive.com/" target="_blank" rel="noopener noreferrer">Remotive</a>. Условия проверяй у работодателя.</p>'
         target_cards = archived_cards if row["status"] == "rejected" else cards
         target_cards.append(f'''
             <article class="card">
@@ -227,6 +278,7 @@ details {{ border-top:1px solid #e5ebf2; padding:12px 0; }} summary {{ cursor:po
 .detail-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:20px; }} ul {{ padding-left:20px; margin-bottom:0; }} li {{ margin:6px 0; }}
 .description {{ white-space:pre-wrap; line-height:1.5; }} textarea {{ box-sizing:border-box; width:100%; min-height:150px; padding:12px; font:inherit; border:1px solid #b9c8dc; border-radius:8px; margin:8px 0; }}
 input[type=email] {{ box-sizing:border-box; width:100%; padding:10px; font:inherit; border:1px solid #b9c8dc; border-radius:8px; margin:8px 0; }}
+input[type=password],input[type=text],input[type=number] {{ box-sizing:border-box; width:100%; padding:10px; font:inherit; border:1px solid #b9c8dc; border-radius:8px; margin:8px 0; }}
 .pick {{ display:block; margin:14px 0; font-weight:600; }} .reject {{ display:inline-block; margin-left:8px; }} .reject button {{ background:#f1e9e9; color:#7f2929; }}
 .saved-draft pre {{ white-space:pre-wrap; font:inherit; }} .warning {{ color:#9a4a05; }} .notice {{ background:#e2f4e7; padding:12px; border-radius:8px; }}
 .empty {{ padding:28px; background:white; border-radius:12px; }} .safety {{ background:#fff4dc; padding:12px; border-radius:8px; }}
@@ -264,9 +316,10 @@ input[type=email] {{ box-sizing:border-box; width:100%; padding:10px; font:inher
 <div class="metric"><strong>{possible_count}</strong><span>Прошли первичный фильтр</span></div>
 <div class="metric"><strong>{draft_ids}</strong><span>Черновиков на проверку</span></div></div>
 <section class="search-panel"><h2>Автоматический поиск</h2>{_search_status(search_status)}{search_button}
-<p class="muted">Поиск идёт по открытым источникам. LinkedIn-переписка и отправка откликов здесь не запускаются.</p></section>
+<p class="muted">Greenhouse · Ashby · Himalayas · Remotive · hh. Ошибка одного источника не останавливает остальные.</p></section>
+{_automation_panel(automation_state, csrf_token, track, profile)}
 <h2 class="section-title">Очередь откликов</h2>
-<p class="safety">Утверждение меняет только статус в локальной базе. Отклик не отправляется работодателю.</p>
+<p class="safety">Утверждённый отклик с адресом работодателя будет отправлен следующим циклом, если Gmail подключён и отправка включена.</p>
 <div class="toolbar">
 <form method="post" action="/refresh" class="secondary"><input type="hidden" name="csrf" value="{_escape(csrf_token)}">{track_input}<button type="submit">Обновить очередь</button></form>
 <form method="post" action="/approve" id="approve-form"><input type="hidden" name="csrf" value="{_escape(csrf_token)}">{track_input}<label class="pick"><input type="checkbox" name="checked" value="yes" required> Я проверил условия вакансий</label><button type="submit">Утвердить выбранные ({draft_ids} доступны)</button></form>
@@ -286,7 +339,8 @@ def _ids(values: list[str]) -> list[int]:
     return result
 
 
-def make_handler(repository: Repository, csrf_token: str, search_runner: SearchRunner | None = None):
+def make_handler(repository: Repository, csrf_token: str, search_runner: SearchRunner | None = None,
+                 automation: AutomationPipeline | None = None):
     class ReviewHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
             return  # Local drafts and form actions should not be echoed into terminal logs.
@@ -333,7 +387,8 @@ def make_handler(repository: Repository, csrf_token: str, search_runner: SearchR
                 profile = repository.get_profile()
                 self._respond(200, render_page(repository.list_reviews(track=track), csrf_token, notice, track,
                                                profile, repository.list_vacancies(200, track=track),
-                                               search_runner.snapshot() if search_runner else None))
+                                               search_runner.snapshot() if search_runner else None,
+                                               automation.snapshot() if automation else None))
             except Exception:
                 self._respond(500, "Could not load the review queue")
 
@@ -358,7 +413,30 @@ def make_handler(repository: Repository, csrf_token: str, search_runner: SearchR
                 if track not in SEARCH_TRACKS:
                     raise ValueError("invalid search track")
                 path = urlsplit(self.path).path
-                if path == "/refresh":
+                if path == "/automation-settings":
+                    if automation is None:
+                        raise ValueError("automation is not configured")
+                    previous = automation.store.load()
+                    email = data.get("email", [""])[0].strip()
+                    password = "".join(data.get("password", [""])[0].split())
+                    if not password and email == previous.email:
+                        password = previous.password
+                    settings = AutomationSettings.from_dict({
+                        "email": email, "password": password, "resume_path": data.get("resume_path", [""])[0].strip(),
+                        "daily_limit": int(data.get("daily_limit", ["5"])[0]),
+                        **{name: data.get(name) == ["yes"] for name in ("notifications", "mailbox", "send_applications", "auto_approve")}})
+                    if not settings.connected:
+                        raise ValueError("enter Gmail and an app password")
+                    settings.smtp(require_resume=settings.send_applications)
+                    if settings.email != previous.email or settings.password != previous.password:
+                        try:
+                            verify_gmail(settings.email, settings.password)
+                        except Exception:
+                            raise ValueError("Gmail connection failed. Check the app password and account access.") from None
+                    automation.store.save(settings)
+                    started = search_runner.trigger() if search_runner else False
+                    notice = "Настройки сохранены. Цикл запущен." if started else "Настройки сохранены; применятся в следующем цикле."
+                elif path == "/refresh":
                     result = refresh_queue(repository, track=track)
                     notice = f"Найдено подходящих: {result['matching']}; новых черновиков: {result['added']}."
                 elif path == "/search-now":
@@ -401,11 +479,12 @@ def make_handler(repository: Repository, csrf_token: str, search_runner: SearchR
     return ReviewHandler
 
 
-def serve(repository: Repository, port: int = 8765, *, search_runner: SearchRunner | None = None) -> None:
+def serve(repository: Repository, port: int = 8765, *, search_runner: SearchRunner | None = None,
+          automation: AutomationPipeline | None = None) -> None:
     if not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
     server = ThreadingHTTPServer(("127.0.0.1", port),
-                                 make_handler(repository, secrets.token_urlsafe(32), search_runner))
+                                 make_handler(repository, secrets.token_urlsafe(32), search_runner, automation))
     print(f"Review queue: http://127.0.0.1:{server.server_port}/", flush=True)
     try:
         if search_runner is not None:
