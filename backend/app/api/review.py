@@ -1,6 +1,7 @@
 import html
 import re
 import secrets
+from dataclasses import replace
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -10,6 +11,7 @@ from app.applications.queue import refresh_queue
 from app.api.search_runner import SearchRunner
 from app.applications.automation import AutomationPipeline, AutomationSettings
 from app.integrations.mailbox import verify_gmail
+from app.integrations.gmail_api import GmailAPIError
 from app.candidate.profile import CandidateProfile
 from app.infrastructure.persistence.postgres import Repository
 from app.matching.rules import evaluate
@@ -93,6 +95,7 @@ def _automation_panel(state: dict | None, csrf: str, track: str, profile: Candid
     if state is None:
         return ""
     connected = state["connected"]
+    oauth = state.get("oauth", {"connected": False, "client_configured": False})
     email = state["email"] or (profile.contact_email if profile else "") or ""
     resume = state["resume_path"]
     if not resume:
@@ -110,21 +113,30 @@ def _automation_panel(state: dict | None, csrf: str, track: str, profile: Candid
                     f'<h3>{_escape(item["title"])}</h3>{_vacancy_link(item["url"])}</article>'
                     for item in state.get("leads", []))
     return f'''<section class="search-panel"><h2>Автопилот</h2>
-<p class="run-status {'ok' if connected else 'error'}">{'Gmail подключён' if connected else 'Один шаг до отправки: подключи Gmail'}</p>
+<p class="run-status {'ok' if connected else 'error'}">{'Gmail API подключён · HTTPS' if oauth['connected'] else 'Gmail подключён · старый SMTP-канал' if connected else 'Поиск работает · почта пока не подключена'}</p>
 <div class="metrics"><div class="metric"><strong>{state['sent_total']}</strong><span>Откликов отправлено</span></div>
 <div class="metric"><strong>{state['notification_pending']}</strong><span>Новых предложений ждут доставки</span></div>
 <div class="metric"><strong>{state['uncertain_total']}</strong><span>Неясных результатов — без повторов</span></div></div>
 <p>Поиск → фильтр → сообщение по шаблону → отправка → история. Без AI.</p>
 <p class="muted">Автоутверждение: свежие Greenhouse/Ashby вакансии, минимум 2 совпавших навыка, удалёнка Worldwide или Belarus и один явно опубликованный адрес для отклика. Остальные — в очереди ниже.</p>
+<h3>Gmail без пароля приложения</h3>
+<p>OAuth через HTTPS, без SMTP. Разрешения: чтение почты и отправка писем. Google даёт чтение всей почты; приложение обрабатывает только LinkedIn/hh-уведомления в INBOX, не меняет метки и не удаляет письма.</p>
+<p class="muted">OAuth-клиент: {'настроен' if oauth['client_configured'] else 'не настроен'}. Один раз в Google Cloud: включи Gmail API, настрой Google Auth Platform (External → Testing), добавь свой Gmail как test user, создай клиент типа Desktop app и скачай JSON. <a href="https://console.cloud.google.com/apis/library/gmail.googleapis.com" target="_blank" rel="noopener noreferrer">Google Cloud ↗</a>. В режиме Testing доступ обычно истекает через 7 дней; потребуется повторный вход.</p>
+<details><summary>Настроить OAuth-клиент · JSON из Google Cloud</summary>
+<form method="post" action="/gmail-client"><input type="hidden" name="csrf" value="{_escape(csrf)}"><input type="hidden" name="track" value="{track}">
+<label>JSON OAuth-клиента Desktop app<textarea name="client_json" rows="5" required autocomplete="off" placeholder='Вставь содержимое скачанного JSON здесь, не в чате'></textarea></label>
+<button type="submit">Сохранить OAuth-клиент локально</button></form></details>
+<form method="post" action="/gmail-connect"><input type="hidden" name="csrf" value="{_escape(csrf)}"><input type="hidden" name="track" value="{track}">
+<button type="submit" {'disabled' if not oauth['client_configured'] else ''}>Войти с Google · системный браузер</button></form>
+{'<form method="post" action="/gmail-disconnect"><input type="hidden" name="csrf" value="' + _escape(csrf) + '"><input type="hidden" name="track" value="' + track + '"><button type="submit">Отключить почту локально</button></form>' if connected else ''}
 <details {'open' if not connected else ''}><summary>Почта и настройки отправки</summary>
 <form method="post" action="/automation-settings"><input type="hidden" name="csrf" value="{_escape(csrf)}"><input type="hidden" name="track" value="{track}">
-<label>Твой Gmail<input type="email" name="email" value="{_escape(email)}" required autocomplete="username"></label>
-<label>Пароль приложения Google (не пароль аккаунта)<input type="password" name="password" {'required' if not connected else ''} autocomplete="new-password" placeholder="{'Оставь пустым, чтобы сохранить подключение' if connected else '16 символов'}"></label>
-<p class="muted">Нужна двухэтапная проверка. <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer">Создать пароль приложения ↗</a>. Вводи его только здесь, не в чате. Доступ проверяется без отправки тестового письма.</p>
+<label>Твой Gmail<input type="email" name="email" value="{_escape(email)}" readonly autocomplete="off"></label>
+<p class="muted">Адрес подтверждается Google при входе. Настройки можно сохранить без подключения — поиск продолжится, письма не уйдут.</p>
 <label>Полный путь к резюме PDF<input type="text" name="resume_path" value="{_escape(resume)}"></label>
 <label>Максимум откликов за 24 часа<input type="number" name="daily_limit" min="1" max="10" value="{state['daily_limit']}" required></label>
-{flags}<p class="muted">Пароль хранится локально в игнорируемом Git файле с доступом только для владельца (0600). Письма читаются без отметки «прочитано». Данные Gmail не отправляются источникам вакансий.</p>
-<button type="submit">{'Сохранить и запустить цикл' if connected else 'Подключить Gmail и запустить'}</button></form></details>
+{flags}<p class="muted">OAuth-токены и настройки хранятся локально вне Git с правами 0600, без шифрования. Пароль Google приложению не нужен. После подключения и сохранения настроек включённые этапы могут отправлять письма.</p>
+<button type="submit">{'Сохранить и запустить цикл' if connected else 'Сохранить настройки · продолжить без почты'}</button></form></details>
 <p class="muted">Ссылки из уведомлений не считаются проверенными вакансиями. Чтобы LinkedIn поступал сюда, включи его Job Alerts с доставкой на этот Gmail. Прямые LinkedIn-сообщения и ATS-формы этот канал не отправляет.</p>
 {'<h3>Из почтовых уведомлений</h3><div class="discovery-list">' + leads + '</div>' if leads else ''}</section>'''
 
@@ -354,6 +366,9 @@ def make_handler(repository: Repository, csrf_token: str, search_runner: SearchR
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(size))
             self.send_header("Cache-Control", "no-store")
+            # WebKit can send Origin: null on POST when every referrer is suppressed.
+            # Keep cross-site referrers suppressed, but preserve same-origin form identity.
+            self.send_header("Referrer-Policy", "no-referrer" if urlsplit(self.path).path == "/gmail-callback" else "same-origin")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
@@ -368,6 +383,7 @@ def make_handler(repository: Repository, csrf_token: str, search_runner: SearchR
             self.send_response(303)
             self.send_header("Location", "/?track=" + track + "&notice=" + quote(notice))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
 
         def do_GET(self) -> None:
@@ -375,6 +391,24 @@ def make_handler(repository: Repository, csrf_token: str, search_runner: SearchR
                 self._respond(400, "Invalid host")
                 return
             path = urlsplit(self.path)
+            if path.path == "/gmail-callback" and automation and automation.oauth:
+                query = parse_qs(path.query)
+                try:
+                    with repository.automation_lock() as acquired:
+                        if not acquired:
+                            raise GmailAPIError("Цикл выполняется. Дождись завершения и повтори подключение.")
+                        def pause_delivery(email):
+                            settings = replace(automation.store.load(), email=email, password="", notifications=False,
+                                               mailbox=False, send_applications=False, auto_approve=False)
+                            automation.store.save(settings)
+                        track, email = automation.oauth.finish(query.get("state", [""])[0],
+                            query.get("code", [""])[0], error="error" in query, on_connected=pause_delivery)
+                    self._redirect("Google подключён. Проверь резюме, включи нужные этапы и сохрани настройки.", track)
+                except GmailAPIError as exc:
+                    self._respond(400, '<p>' + _escape(exc) + '</p><a href="/">Вернуться в панель</a>')
+                except Exception:
+                    self._respond(500, '<p>Не удалось завершить OAuth. Начни подключение из панели заново.</p><a href="/">В панель</a>')
+                return
             if path.path != "/":
                 self._respond(404, "Not found")
                 return
@@ -413,11 +447,39 @@ def make_handler(repository: Repository, csrf_token: str, search_runner: SearchR
                 if track not in SEARCH_TRACKS:
                     raise ValueError("invalid search track")
                 path = urlsplit(self.path).path
-                if path == "/automation-settings":
+                if path in {"/gmail-client", "/gmail-connect", "/gmail-disconnect"}:
+                    if automation is None or automation.oauth is None:
+                        raise ValueError("OAuth is not configured")
+                    with repository.automation_lock() as acquired:
+                        if not acquired:
+                            raise ValueError("Цикл выполняется. Дождись завершения перед изменением подключения.")
+                        if path == "/gmail-client":
+                            automation.oauth.configure(data.get("client_json", [""])[0])
+                            notice = "OAuth-клиент сохранён. Нажми «Войти с Google»."
+                        elif path == "/gmail-disconnect":
+                            automation.oauth.disconnect()
+                            automation.store.save(replace(automation.store.load(), password=""))
+                            notice = "Почта отключена локально. Поиск продолжает работать. Отозвать доступ можно в аккаунте Google."
+                        else:
+                            import webbrowser
+                            url = automation.oauth.begin(self.server.server_port, track)
+                            try:
+                                opened = webbrowser.open(url, new=2)
+                            except Exception:
+                                opened = False
+                            self._respond(200, '<h2>Вход в Google</h2><p>' +
+                                ('Вход открыт в системном браузере.' if opened else 'Не удалось открыть системный браузер автоматически.') +
+                                ' Разрешения подтверждаешь ты. Если браузер не открылся, скопируй ссылку в Chrome/Safari, не во встроенный браузер.</p>' +
+                                '<textarea readonly rows="8">' + _escape(url) + '</textarea><p><a href="/?track=' + track + '">Вернуться в панель</a></p>')
+                            return
+                elif path == "/automation-settings":
                     if automation is None:
                         raise ValueError("automation is not configured")
                     previous = automation.store.load()
                     email = data.get("email", [""])[0].strip()
+                    oauth_connected = bool(automation.oauth and automation.oauth.status()["connected"])
+                    if oauth_connected:
+                        email = automation.oauth.status()["email"]
                     password = "".join(data.get("password", [""])[0].split())
                     if not password and email == previous.email:
                         password = previous.password
@@ -425,10 +487,9 @@ def make_handler(repository: Repository, csrf_token: str, search_runner: SearchR
                         "email": email, "password": password, "resume_path": data.get("resume_path", [""])[0].strip(),
                         "daily_limit": int(data.get("daily_limit", ["5"])[0]),
                         **{name: data.get(name) == ["yes"] for name in ("notifications", "mailbox", "send_applications", "auto_approve")}})
-                    if not settings.connected:
-                        raise ValueError("enter Gmail and an app password")
-                    settings.smtp(require_resume=settings.send_applications)
-                    if settings.email != previous.email or settings.password != previous.password:
+                    if settings.send_applications:
+                        settings.attachment()
+                    if settings.connected and not oauth_connected and (settings.email != previous.email or settings.password != previous.password):
                         try:
                             verify_gmail(settings.email, settings.password)
                         except Exception:

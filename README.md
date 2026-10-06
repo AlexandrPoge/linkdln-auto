@@ -71,7 +71,7 @@ The command needs no database or email credentials. It extracts direct LinkedIn 
 
 ## Email delivery
 
-The dashboard's **Автопилот** form connects Gmail locally and enables scheduled applications/digests according to its checkboxes. Google app passwords require two-step verification; enter one only in the localhost form, never in chat. Settings stay in ignored `data/automation.json` with owner-only permissions (0600), not encrypted. Defaults cap applications at 5 per rolling 24 hours. Missing application addresses leave jobs in review. See [docs/automation.md](docs/automation.md) for the full workflow, limitations, and background service.
+The dashboard's **Автопилот** connects Gmail through Desktop OAuth + Gmail API over HTTPS, without an app password or SMTP. One-time Google Cloud client setup is required: see [OAuth setup](docs/gmail-oauth.md). Consent opens in the system browser, not an embedded browser. After connection, enable the desired email stages and save; sending stays paused until then. Tokens/settings stay in ignored `data/` files with owner-only permissions (0600), not encrypted. Defaults cap applications at 5 per rolling 24 hours. Missing application addresses leave jobs in review. See [docs/automation.md](docs/automation.md) for the full workflow, limitations, and background service.
 
 The older environment-based CLI below remains a separate, preview-by-default delivery path; it does not use the dashboard's saved Gmail settings.
 

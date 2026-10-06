@@ -12,6 +12,7 @@ from typing import Any
 from app.applications.delivery import deliver_approved, is_email_address
 from app.integrations.email_sender import SMTPApplicationSender, SMTPSettings, send_email
 from app.integrations.mailbox import collect_alerts
+from app.integrations.gmail_api import GmailOAuth, GmailApplicationSender, GmailAPIError
 from app.matching.rules import evaluate
 from app.templates.drafts import render_application
 from app.vacancies.models import Vacancy
@@ -56,17 +57,19 @@ class AutomationSettings:
     def smtp(self, *, require_resume: bool = True) -> SMTPSettings:
         if not self.connected:
             raise ValueError("Gmail is not connected")
-        filename, content = "", b""
-        if require_resume:
-            path = Path(self.resume_path)
-            if not path.is_absolute() or not path.is_file() or not 1 <= path.stat().st_size <= 5_000_000:
-                raise ValueError("select an existing absolute PDF path, at most 5 MB")
-            content = path.read_bytes()
-            if not content.startswith(b"%PDF-"):
-                raise ValueError("resume is not a PDF")
-            filename = path.name
+        filename, content = self.attachment() if require_resume else ("", b"")
         return SMTPSettings("smtp.gmail.com", 465, "ssl", self.email, self.password,
                             self.email, filename, content)
+
+    def attachment(self) -> tuple[str, bytes]:
+        filename, content = "", b""
+        path = Path(self.resume_path)
+        if not path.is_absolute() or not path.is_file() or not 1 <= path.stat().st_size <= 5_000_000:
+            raise ValueError("select an existing absolute PDF path, at most 5 MB")
+        content = path.read_bytes()
+        if not content.startswith(b"%PDF-"):
+            raise ValueError("resume is not a PDF")
+        return path.name, content
 
 
 class SettingsStore:
@@ -133,9 +136,10 @@ def automatic_candidate(profile, row: dict) -> str | None:
 
 
 class AutomationPipeline:
-    def __init__(self, repository, store: SettingsStore) -> None:
+    def __init__(self, repository, store: SettingsStore, oauth=None) -> None:
         self.repository = repository
         self.store = store
+        self.oauth = oauth or (GmailOAuth(store.path.parent) if isinstance(store.path, Path) else None)
 
     def __call__(self, repository, sources) -> dict:
         with repository.automation_lock() as acquired:
@@ -147,33 +151,47 @@ class AutomationPipeline:
     def _run(self, repository, sources) -> dict:
         report = run_searches(repository, sources)
         settings = self.store.load()
+        api_connected = bool(self.oauth and self.oauth.status()["connected"])
+        connected = api_connected or settings.connected
+        email = self.oauth.status()["email"] if api_connected else settings.email
         profile = repository.get_profile()
-        stages: dict[str, Any] = {"connected": settings.connected, "mailbox": "not connected",
+        stages: dict[str, Any] = {"connected": connected, "transport": "Gmail API" if api_connected else "SMTP/IMAP",
+                                  "mailbox": "not connected",
                                   "auto_approved": 0, "applications": "not connected", "digest": "not connected"}
         report["automation"] = stages
         # Durable pending notifications also accumulate before the account is connected.
         repository.enqueue_notifications()
-        if not settings.connected:
+        if not connected:
             return report
         if settings.mailbox:
             try:
-                stages["mailbox"] = collect_alerts(repository, settings.email, settings.password)
+                stages["mailbox"] = (self.oauth.collect_alerts(repository) if api_connected else
+                                     collect_alerts(repository, settings.email, settings.password))
+            except GmailAPIError as exc:
+                stages["mailbox"] = str(exc)
             except Exception:
                 stages["mailbox"] = "failed: check Gmail access; other stages continue"
         else:
             stages["mailbox"] = "disabled"
         if settings.send_applications:
             try:
-                smtp = settings.smtp()
+                if api_connected:
+                    filename, content = settings.attachment()
+                    self.oauth.access_token()  # Check access before claiming application attempts.
+                    sender = GmailApplicationSender(self.oauth, filename, content)
+                else:
+                    sender = SMTPApplicationSender(settings.smtp())
                 if settings.auto_approve:
                     for row in repository.list_reviews(500):
                         recipient = automatic_candidate(profile, row)
-                        if recipient and recipient != settings.email.lower():
+                        if recipient and recipient != email.lower():
                             stages["auto_approved"] += repository.auto_approve_review(row, recipient)
-                result = deliver_approved(repository, SMTPApplicationSender(smtp),
+                result = deliver_approved(repository, sender,
                                           limit=10, execute=True, daily_limit=settings.daily_limit)
                 stages["applications"] = result
                 report["sent"] = result["sent"]
+            except GmailAPIError as exc:
+                stages["applications"] = str(exc)
             except Exception:
                 stages["applications"] = "failed: check Gmail and resume PDF; no automatic retry"
         else:
@@ -181,6 +199,8 @@ class AutomationPipeline:
         repository.enqueue_notifications()
         if settings.notifications:
             try:
+                if api_connected:
+                    self.oauth.access_token()  # An expired grant must not consume pending notifications.
                 items = repository.claim_notifications(25)
                 if not items:
                     stages["digest"] = {"sent": 0, "items": 0}
@@ -188,8 +208,9 @@ class AutomationPipeline:
                     body = "Новые вакансии и ссылки для Automation Engineer\n\n" + "\n\n".join(
                         f"{item['title']}\n{item['source']} · {item['kind']}\n{item['url']}" for item in items)
                     try:
-                        reference = send_email(settings.smtp(require_resume=False), settings.email,
-                                               f"Поиск работы: {len(items)} новых предложений", body)
+                        subject = f"Поиск работы: {len(items)} новых предложений"
+                        reference = (self.oauth.send(email, subject, body) if api_connected else
+                                     send_email(settings.smtp(require_resume=False), email, subject, body))
                     except Exception:
                         repository.finish_notifications([item["id"] for item in items], sent=False)
                         stages["digest"] = "uncertain: check mailbox before any retry"
@@ -197,6 +218,8 @@ class AutomationPipeline:
                         repository.finish_notifications([item["id"] for item in items], sent=True,
                                                         reference=reference)
                         stages["digest"] = {"sent": 1, "items": len(items)}
+            except GmailAPIError as exc:
+                stages["digest"] = str(exc)
             except Exception:
                 stages["digest"] = "failed: check email connection"
         else:
@@ -205,7 +228,9 @@ class AutomationPipeline:
 
     def snapshot(self) -> dict:
         settings = self.store.load()
-        return {"connected": settings.connected, "email": settings.email, "resume_path": settings.resume_path,
+        oauth = self.oauth.status() if self.oauth else {"connected": False, "client_configured": False, "email": ""}
+        return {"connected": settings.connected or oauth["connected"], "oauth": oauth,
+                "email": oauth["email"] if oauth["connected"] else settings.email, "resume_path": settings.resume_path,
                 "notifications": settings.notifications, "mailbox": settings.mailbox,
                 "send_applications": settings.send_applications, "auto_approve": settings.auto_approve,
                 "daily_limit": settings.daily_limit, **self.repository.automation_stats(),

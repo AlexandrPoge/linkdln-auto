@@ -1,6 +1,7 @@
 import http.client
 import io
 import threading
+from contextlib import nullcontext
 import unittest
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
@@ -22,10 +23,72 @@ def _review() -> dict:
 
 
 class ReviewPageTests(unittest.TestCase):
+    def test_referrer_policy_preserves_webkit_form_origin_but_hides_callback(self):
+        handler_class = make_handler(Mock(), "test-token")
+        for path, policy in (("/", "same-origin"), ("/gmail-callback?code=private", "no-referrer")):
+            handler = object.__new__(handler_class)
+            handler.path = path
+            handler.send_response, handler.send_header, handler.end_headers = Mock(), Mock(), Mock()
+            handler._headers(200, "text/html", 0)
+            handler.send_header.assert_any_call("Referrer-Policy", policy)
+
+    def test_oauth_routes_check_csrf_and_callback_pauses_sending(self):
+        from app.applications.automation import AutomationSettings
+        repository, automation = Mock(), Mock()
+        repository.automation_lock.return_value = nullcontext(True)
+        automation.store.load.return_value = AutomationSettings("example@gmail.com", "a" * 16)
+        handler_class = make_handler(repository, "test-token", automation=automation)
+
+        def handler(path, body=b""):
+            value = object.__new__(handler_class)
+            value.server = SimpleNamespace(server_port=8765)
+            value.headers = {"Host": "127.0.0.1:8765", "Content-Length": str(len(body)),
+                             "Content-Type": "application/x-www-form-urlencoded"}
+            value.path, value.rfile, value.wfile = path, io.BytesIO(body), io.BytesIO()
+            value.send_response, value.send_header, value.end_headers = Mock(), Mock(), Mock()
+            return value
+
+        bad = handler("/gmail-client", urlencode({"csrf": "wrong", "client_json": "private"}).encode())
+        bad.do_POST()
+        self.assertEqual(bad.send_response.call_args.args[0], 403)
+        automation.oauth.configure.assert_not_called()
+        good = handler("/gmail-client", urlencode({"csrf": "test-token", "client_json": "private"}).encode())
+        good.do_POST()
+        self.assertEqual(good.send_response.call_args.args[0], 303)
+        automation.oauth.configure.assert_called_once_with("private")
+        self.assertNotIn("private", str(good.send_header.call_args_list))
+
+        def finish(state, code, *, error, on_connected):
+            self.assertEqual((state, code, error), ("state", "private-code", False))
+            on_connected("verified@gmail.com")
+            return "international", "verified@gmail.com"
+        automation.oauth.finish.side_effect = finish
+        callback = handler("/gmail-callback?state=state&code=private-code")
+        callback.do_GET()
+        self.assertEqual(callback.send_response.call_args.args[0], 303)
+        saved = automation.store.save.call_args.args[0]
+        self.assertEqual(saved.email, "verified@gmail.com")
+        self.assertFalse(saved.password)
+        self.assertFalse(saved.notifications or saved.mailbox or saved.send_applications or saved.auto_approve)
+        self.assertNotIn("private-code", str(callback.send_header.call_args_list))
+
+    def test_oauth_panel_never_renders_tokens_or_password_fields(self):
+        state = {"connected": False, "email": "example@gmail.com", "resume_path": "", "daily_limit": 5,
+                 "notifications": True, "mailbox": True, "send_applications": True, "auto_approve": True,
+                 "sent_total": 0, "notification_pending": 1, "uncertain_total": 0,
+                 "oauth": {"connected": False, "client_configured": False}}
+        page = render_page([], "csrf", automation_state=state)
+        self.assertIn("OAuth-клиент: не настроен", page)
+        self.assertIn("Сохранить настройки · продолжить без почты", page)
+        self.assertNotIn('name="password"', page)
+        self.assertIn('action="/gmail-connect"', page)
+        self.assertIn("7 дней", page)
+
     @patch("app.api.review.verify_gmail")
     def test_gmail_form_checks_csrf_then_verifies_without_echoing_password(self, verify):
         from app.applications.automation import AutomationSettings
         repository, runner, automation = Mock(), Mock(), Mock()
+        automation.oauth = None
         automation.store.load.return_value = AutomationSettings()
         runner.trigger.return_value = True
         handler_class = make_handler(repository, "test-token", runner, automation)
@@ -58,13 +121,15 @@ class ReviewPageTests(unittest.TestCase):
         repository.approve_reviews.return_value = 1
         handler_class = make_handler(repository, "test-token")
 
-        def submit(form: dict[str, str]) -> int:
+        def submit(form: dict[str, str], origin=None) -> int:
             body = urlencode(form).encode()
             handler = object.__new__(handler_class)
             handler.server = SimpleNamespace(server_port=8765)
             handler.headers = {"Host": "127.0.0.1:8765", "Content-Length": str(len(body)),
                                "Content-Type": "application/x-www-form-urlencoded"}
             handler.path = "/approve"
+            if origin is not None:
+                handler.headers["Origin"] = origin
             handler.rfile = io.BytesIO(body)
             handler.wfile = io.BytesIO()
             handler.send_response = Mock()
@@ -74,6 +139,8 @@ class ReviewPageTests(unittest.TestCase):
             return handler.send_response.call_args.args[0]
 
         self.assertEqual(submit({"csrf": "wrong", "id": "7", "checked": "yes"}), 403)
+        for origin in ("null", "https://evil.test", "http://127.0.0.1:9999"):
+            self.assertEqual(submit({"csrf": "test-token", "id": "7", "checked": "yes"}, origin), 403)
         self.assertEqual(submit({"csrf": "test-token", "id": "7"}), 400)
         repository.approve_reviews.assert_not_called()
         self.assertEqual(submit({"csrf": "test-token", "id": "7", "checked": "yes"}), 303)

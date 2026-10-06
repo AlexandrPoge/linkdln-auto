@@ -30,6 +30,48 @@ def review():
 
 
 class AutomationTests(unittest.TestCase):
+    @patch("app.applications.automation.run_searches")
+    @patch("app.applications.automation.collect_alerts")
+    @patch("app.applications.automation.send_email")
+    @patch("app.applications.automation.deliver_approved")
+    def test_oauth_pipeline_uses_api_only_and_existing_delivery_guards(self, deliver, smtp_send, imap, search):
+        search.return_value = {"sources": [], "successful": 1, "failed": 0, "sent": 0}
+        deliver.return_value = {"sent": 1, "uncertain": 0}
+        repository = Mock()
+        repository.automation_lock.return_value = nullcontext(True)
+        repository.list_reviews.return_value = []
+        repository.claim_notifications.return_value = [{"id": 2, "title": "Engineer", "source": "ashby",
+                                                        "kind": "Matched", "url": "https://example.com/2"}]
+        store, oauth = Mock(), Mock()
+        store.load.return_value = AutomationSettings(email="example@gmail.com")
+        oauth.status.return_value = {"connected": True, "email": "example@gmail.com", "client_configured": True}
+        oauth.collect_alerts.return_value = {"processed": 1, "new_links": 1}
+        oauth.send.return_value = "gmail-digest-id"
+        with patch.object(AutomationSettings, "attachment", return_value=("resume.pdf", b"%PDF-test")):
+            report = AutomationPipeline(repository, store, oauth)(repository, ())
+        self.assertEqual(report["sent"], 1)
+        self.assertEqual(report["automation"]["transport"], "Gmail API")
+        self.assertEqual(deliver.call_args.kwargs["daily_limit"], 5)
+        self.assertEqual(deliver.call_args.args[1].channel, "email")
+        oauth.collect_alerts.assert_called_once_with(repository)
+        oauth.send.assert_called_once()
+        smtp_send.assert_not_called()
+        imap.assert_not_called()
+        repository.finish_notifications.assert_called_once_with([2], sent=True, reference="gmail-digest-id")
+
+    @patch("app.applications.automation.run_searches")
+    def test_expired_oauth_access_does_not_consume_outbox(self, search):
+        from app.integrations.gmail_api import GmailAPIError
+        search.return_value = {"sources": [], "successful": 1, "failed": 0, "sent": 0}
+        repository, store, oauth = Mock(), Mock(), Mock()
+        repository.automation_lock.return_value = nullcontext(True)
+        store.load.return_value = AutomationSettings(email="example@gmail.com", mailbox=False, send_applications=False)
+        oauth.status.return_value = {"connected": True, "email": "example@gmail.com"}
+        oauth.access_token.side_effect = GmailAPIError("Gmail API: подключи аккаунт заново")
+        report = AutomationPipeline(repository, store, oauth)(repository, ())
+        repository.claim_notifications.assert_not_called()
+        self.assertIn("заново", report["automation"]["digest"])
+
     def test_settings_are_private_and_password_not_in_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory) / "automation.json")
